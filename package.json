@@ -1,0 +1,31 @@
+{
+  "name": "plan-pilot",
+  "version": "0.1.0",
+  "description": "引导式任务录入、目标拆解和自动时间规划工具。",
+  "private": true,
+  "author": "Yang Yu (YangYu-NUAA)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/YangYu-NUAA/plan-pilot.git"
+  },
+  "bugs": {
+    "url": "https://github.com/YangYu-NUAA/plan-pilot/issues"
+  },
+  "homepage": "https://github.com/YangYu-NUAA/plan-pilot#readme",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "vite build",
+    "preview": "vite preview --host 127.0.0.1"
+  },
+  "dependencies": {
+    "lucide-react": "^0.468.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.4",
+    "vite": "^6.0.5"
+  }
+}
