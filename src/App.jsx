@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlarmClock,
   CalendarDays,
@@ -8,6 +8,7 @@ import {
   Download,
   ListChecks,
   Moon,
+  Pencil,
   Plus,
   RefreshCw,
   Send,
@@ -16,6 +17,7 @@ import {
   Trash2,
   Upload,
   Wand2,
+  X,
 } from "lucide-react";
 
 const APP_NAME = "计划引航";
@@ -246,7 +248,9 @@ function hydrateState(input) {
     ...input,
     settings: { ...defaultState.settings, ...(input?.settings || {}) },
     ai: { ...defaultState.ai, ...(input?.ai || {}) },
-    goals: Array.isArray(input?.goals) ? input.goals : [],
+    goals: Array.isArray(input?.goals)
+      ? input.goals.map((g) => ({ progress: 0, ...g }))
+      : [],
     tasks: mergeDuplicateTasks(Array.isArray(input?.tasks) ? input.tasks : []),
     blocks: Array.isArray(input?.blocks) ? input.blocks : [],
     dayPlans: input?.dayPlans && typeof input.dayPlans === "object" ? input.dayPlans : {},
@@ -889,7 +893,7 @@ function App() {
   const guideQuestion = getGuideQuestion({ dayPlan, todayTasks, todayBlocks, plannedMinutes, workMinutes: availableMinutes });
   const viewHeadline =
     activeView === "today"
-      ? guideQuestion
+      ? formatHumanDate(selectedDate)
       : activeView === "goals"
         ? "先选一个目标，把它拆成更小的下一步。"
         : "收束今天的结果，并决定明天先做什么。";
@@ -993,6 +997,7 @@ function App() {
         parentId: String(fieldValue(form, "parentId", goalDraft.parentId || "")),
         priority: String(fieldValue(form, "priority", goalDraft.priority)),
         status: "active",
+        progress: 0,
         createdAt: new Date().toISOString(),
       }),
     }));
@@ -1072,15 +1077,23 @@ function App() {
     }));
   }
 
+  function deleteGoal(goalId) {
+    patchPlanner((current) => ({
+      goals: current.goals
+        .filter((goal) => goal.id !== goalId)
+        .map((goal) => (goal.parentId === goalId ? { ...goal, parentId: "" } : goal)),
+    }));
+  }
+
   async function generateBreakdown(event) {
     event.preventDefault();
     const goal = planner.goals.find((item) => item.id === breakdownDraft.goalId) || planner.goals[0];
     if (!goal) return;
     setBreakdownDraft((draft) => ({ ...draft, goalId: goal.id }));
 
-    if (!planner.ai.enabled || !planner.ai.apiKey.trim()) {
+    if (!planner.ai.enabled) {
       setBreakdownSuggestions(filterBreakdownItems(makeBreakdown(goal, breakdownDraft, selectedDate), planner, goal));
-      setAiStatus({ loading: false, error: "", message: "已使用规则拆解。启用 AI 并填写 Key 后，可改用大模型拆解。" });
+      setAiStatus({ loading: false, error: "", message: "已使用规则拆解。启用 AI 后可改用大模型拆解。" });
       return;
     }
 
@@ -1168,6 +1181,7 @@ function App() {
             parentId: goal.id,
             priority: item.priority,
             status: "active",
+            progress: 0,
             deadline: breakdownDraft.deadline,
             createdAt: new Date().toISOString(),
           })),
@@ -1193,8 +1207,8 @@ function App() {
   }
 
   async function generateTodayAiGuide() {
-    if (!planner.ai.enabled || !planner.ai.apiKey.trim()) {
-      setAiStatus({ loading: false, error: "请先在左侧启用 AI 并填写当前服务商的 API Key。", message: "" });
+    if (!planner.ai.enabled) {
+      setAiStatus({ loading: false, error: "请先在左侧启用 AI。", message: "" });
       return;
     }
 
@@ -1291,11 +1305,11 @@ function App() {
   }
 
   async function runPlanningCoach(nextMessages) {
-    if (!planner.ai.enabled || !planner.ai.apiKey.trim()) {
+    if (!planner.ai.enabled) {
       setPlanningCoach((coach) => ({
         ...coach,
         loading: false,
-        error: "请先在左侧启用 AI 并填写当前服务商的 API Key。",
+        error: "请先在左侧启用 AI。",
       }));
       return;
     }
@@ -1395,6 +1409,7 @@ function App() {
           parentId: validGoalIds.has(item.parentId) ? item.parentId : "",
           priority: item.priority,
           status: "active",
+          progress: 0,
           createdAt: new Date().toISOString(),
         }))
         .filter((goal) => {
@@ -1717,12 +1732,14 @@ function App() {
             addGoal={addGoal}
             submitGoalForm={submitGoalForm}
             updateGoal={updateGoal}
+            deleteGoal={deleteGoal}
             breakdownDraft={breakdownDraft}
             setBreakdownDraft={setBreakdownDraft}
             breakdownSuggestions={breakdownSuggestions}
             generateBreakdown={generateBreakdown}
             acceptBreakdown={acceptBreakdown}
             aiStatus={aiStatus}
+            goalById={goalById}
           />
         )}
 
@@ -1793,9 +1810,38 @@ function TodayView({
   acceptPlanningCoachSuggestions,
 }) {
   const overload = plannedMinutes > workMinutes;
+  const [editingTaskId, setEditingTaskId] = useState(null);
+  const [editDraft, setEditDraft] = useState({ title: "", estimateMinutes: 60, priority: "medium", goalId: "" });
+
+  function startEditingTask(task) {
+    setEditingTaskId(task.id);
+    setEditDraft({
+      title: task.title,
+      estimateMinutes: Number(task.estimateMinutes) || 60,
+      priority: task.priority,
+      goalId: task.goalId || "",
+    });
+  }
+
+  function cancelEditingTask() {
+    setEditingTaskId(null);
+  }
+
+  function saveEditingTask(taskId) {
+    if (!editDraft.title.trim()) return;
+    updateTask(taskId, {
+      title: editDraft.title.trim(),
+      estimateMinutes: Number(editDraft.estimateMinutes) || 30,
+      priority: editDraft.priority,
+      goalId: editDraft.goalId || "",
+    });
+    setEditingTaskId(null);
+  }
+
+  const layoutClass = dayPlan.morningDone ? "today-grid layout-done" : "today-grid";
 
   return (
-    <div className="today-grid">
+    <div className={layoutClass}>
       <section className="coach-band">
         <div className="coach-copy">
           <p className="eyebrow">晨间问题</p>
@@ -2022,7 +2068,65 @@ function TodayView({
           {todayTasks.length === 0 && <EmptyState icon={<Target size={22} />} text="先写下今天的一件具体工作。" />}
           {todayTasks
             .sort((a, b) => priorityOrder[b.priority] - priorityOrder[a.priority])
-            .map((task) => (
+            .map((task) => {
+              const isEditing = editingTaskId === task.id;
+              const parentGoal = task.goalId && goalById[task.goalId];
+
+              if (isEditing) {
+                return (
+                  <article className="task-item editing" key={task.id}>
+                    <div className="edit-task-form">
+                      <input
+                        value={editDraft.title}
+                        onChange={(e) => setEditDraft((d) => ({ ...d, title: e.target.value }))}
+                        placeholder="任务标题"
+                      />
+                      <div className="edit-task-row">
+                        <input
+                          type="number"
+                          min="10"
+                          step="10"
+                          value={editDraft.estimateMinutes}
+                          onChange={(e) => setEditDraft((d) => ({ ...d, estimateMinutes: Number(e.target.value) }))}
+                          aria-label="预计分钟"
+                        />
+                        <select
+                          value={editDraft.priority}
+                          onChange={(e) => setEditDraft((d) => ({ ...d, priority: e.target.value }))}
+                          aria-label="优先级"
+                        >
+                          <option value="high">高</option>
+                          <option value="medium">中</option>
+                          <option value="low">低</option>
+                        </select>
+                        <select
+                          value={editDraft.goalId}
+                          onChange={(e) => setEditDraft((d) => ({ ...d, goalId: e.target.value }))}
+                          aria-label="关联目标"
+                        >
+                          <option value="">无关联</option>
+                          {activeGoals.map((g) => (
+                            <option key={g.id} value={g.id}>
+                              {goalTypeLabel[g.type]} · {g.title}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                      <div className="edit-task-actions">
+                        <button className="secondary-action" onClick={() => saveEditingTask(task.id)}>
+                          <CheckCircle2 size={16} />
+                          保存
+                        </button>
+                        <button className="icon-button" onClick={cancelEditingTask}>
+                          <X size={17} />
+                        </button>
+                      </div>
+                    </div>
+                  </article>
+                );
+              }
+
+              return (
               <article className={`task-item ${task.status === "done" ? "done" : ""}`} key={task.id}>
                 <button
                   className="check-button"
@@ -2033,11 +2137,20 @@ function TodayView({
                 </button>
                 <div className="task-main">
                   <strong>{task.title}</strong>
-                  <span>
-                    {priorityLabel[task.priority]}优先级 · {task.estimateMinutes} 分钟
-                    {task.goalId && ` · ${goalById[task.goalId]?.title || ""}`}
+                  <span className="task-meta">
+                    <span className={`priority-badge ${task.priority}`}>{priorityLabel[task.priority]}</span>
+                    <span>{task.estimateMinutes} 分钟</span>
+                    {parentGoal && (
+                      <span className="task-goal-link">
+                        <Target size={12} />
+                        {parentGoal.title}
+                      </span>
+                    )}
                   </span>
                 </div>
+                <button title="编辑任务" className="icon-button" onClick={() => startEditingTask(task)}>
+                  <Pencil size={17} />
+                </button>
                 <button title="顺延到明天" className="icon-button" onClick={() => deferTask(task.id)}>
                   <RefreshCw size={17} />
                 </button>
@@ -2045,7 +2158,8 @@ function TodayView({
                   <Trash2 size={17} />
                 </button>
               </article>
-            ))}
+            );
+            })}
         </div>
       </section>
 
@@ -2195,13 +2309,9 @@ function GoalsView({
   generateBreakdown,
   acceptBreakdown,
   aiStatus,
+  goalById,
+  deleteGoal,
 }) {
-  const grouped = {
-    long: goals.filter((goal) => goal.type === "long"),
-    month: goals.filter((goal) => goal.type === "month"),
-    week: goals.filter((goal) => goal.type === "week"),
-  };
-
   const parentOptions = goals.filter((goal) => {
     if (goalDraft.type === "long") return false;
     if (goalDraft.type === "month") return goal.type === "long";
@@ -2331,45 +2441,360 @@ function GoalsView({
         )}
       </section>
 
-      <section className="goal-columns">
-        {Object.entries(grouped).map(([type, items]) => (
-          <div className="goal-column" key={type}>
-            <div className="column-heading">
+      <GoalGraph
+        goals={goals}
+        goalById={goalById}
+        updateGoal={updateGoal}
+        deleteGoal={deleteGoal}
+        goalTypeLabel={goalTypeLabel}
+        TargetIcon={Target}
+        EmptyState={EmptyState}
+      />
+    </div>
+  );
+}
+
+function buildGoalRows(goals) {
+  const childrenMap = {};
+  goals.forEach((g) => {
+    if (g.parentId) {
+      if (!childrenMap[g.parentId]) childrenMap[g.parentId] = [];
+      childrenMap[g.parentId].push(g);
+    }
+  });
+
+  const rows = [];
+  const placed = new Set();
+
+  function placeInRow(goal, rowIndex) {
+    if (placed.has(goal.id)) return;
+    while (rows.length <= rowIndex) rows.push({ long: [], month: [], week: [] });
+    rows[rowIndex][goal.type].push(goal);
+    placed.add(goal.id);
+    (childrenMap[goal.id] || []).forEach((child) => placeInRow(child, rowIndex));
+  }
+
+  // place long roots first — each root starts a new row group
+  const longRoots = goals.filter((g) => g.type === "long" && !g.parentId);
+  longRoots.forEach((root, i) => placeInRow(root, i));
+
+  // place remaining unplaced goals in new rows
+  goals.forEach((g) => {
+    if (!placed.has(g.id)) {
+      placeInRow(g, rows.length);
+    }
+  });
+
+  return rows;
+}
+
+function getConnectedIds(goalId, goals) {
+  const parentMap = {};
+  const childrenMap = {};
+  goals.forEach((g) => {
+    parentMap[g.id] = g.parentId;
+    if (g.parentId) {
+      if (!childrenMap[g.parentId]) childrenMap[g.parentId] = [];
+      childrenMap[g.parentId].push(g.id);
+    }
+  });
+
+  const connected = new Set([goalId]);
+
+  // walk up
+  let cursor = goalId;
+  while (parentMap[cursor]) {
+    connected.add(parentMap[cursor]);
+    cursor = parentMap[cursor];
+  }
+
+  // walk down
+  const stack = childrenMap[goalId] ? [...childrenMap[goalId]] : [];
+  while (stack.length) {
+    const id = stack.pop();
+    connected.add(id);
+    if (childrenMap[id]) stack.push(...childrenMap[id]);
+  }
+
+  return connected;
+}
+
+function GoalGraph({ goals, goalById, updateGoal, deleteGoal, goalTypeLabel, TargetIcon, EmptyState }) {
+  const graphRef = useRef(null);
+  const goalRefs = useRef(new Map());
+  const [hoveredGoalId, setHoveredGoalId] = useState(null);
+  const [lines, setLines] = useState([]);
+  const [editingGoalId, setEditingGoalId] = useState(null);
+  const [editDraft, setEditDraft] = useState({ title: "", priority: "medium", parentId: "" });
+
+  function startEditingGoal(goal) {
+    setEditingGoalId(goal.id);
+    setEditDraft({
+      title: goal.title,
+      priority: goal.priority,
+      parentId: goal.parentId || "",
+    });
+  }
+
+  function cancelEditingGoal() {
+    setEditingGoalId(null);
+  }
+
+  function saveEditingGoal(goalId) {
+    if (!editDraft.title.trim()) return;
+    updateGoal(goalId, {
+      title: editDraft.title.trim(),
+      priority: editDraft.priority,
+      parentId: editDraft.parentId || "",
+    });
+    setEditingGoalId(null);
+  }
+
+  function handleStatusChange(goal, newStatus) {
+    if (newStatus === "done") {
+      updateGoal(goal.id, { status: "done", progress: 100 });
+    } else {
+      updateGoal(goal.id, { status: newStatus });
+    }
+  }
+
+  function handleProgressChange(goal, value) {
+    const progress = Number(value);
+    if (progress >= 100) {
+      updateGoal(goal.id, { progress: 100, status: "done" });
+    } else {
+      updateGoal(goal.id, { progress });
+    }
+  }
+
+  const rows = useMemo(() => buildGoalRows(goals), [goals]);
+
+  const connectedIds = useMemo(
+    () => (hoveredGoalId ? getConnectedIds(hoveredGoalId, goals) : new Set()),
+    [hoveredGoalId, goals],
+  );
+
+  const computeLines = useCallback(() => {
+    if (!graphRef.current) return;
+    const containerRect = graphRef.current.getBoundingClientRect();
+    const newLines = [];
+
+    goals.forEach((goal) => {
+      if (!goal.parentId) return;
+      const parentEl = goalRefs.current.get(goal.parentId);
+      const childEl = goalRefs.current.get(goal.id);
+      if (!parentEl || !childEl) return;
+
+      const pr = parentEl.getBoundingClientRect();
+      const cr = childEl.getBoundingClientRect();
+
+      const x1 = pr.right - containerRect.left;
+      const y1 = pr.top + pr.height / 2 - containerRect.top;
+      const x2 = cr.left - containerRect.left;
+      const y2 = cr.top + cr.height / 2 - containerRect.top;
+
+      const cx = (x1 + x2) / 2;
+      newLines.push({
+        key: `${goal.parentId}-${goal.id}`,
+        parentId: goal.parentId,
+        childId: goal.id,
+        d: `M${x1},${y1} C${cx},${y1} ${cx},${y2} ${x2},${y2}`,
+      });
+    });
+
+    setLines(newLines);
+  }, [goals]);
+
+  useEffect(() => {
+    computeLines();
+    const onResize = () => computeLines();
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, [computeLines]);
+
+  const setGoalRef = useCallback((goalId, el) => {
+    if (el) {
+      goalRefs.current.set(goalId, el);
+    } else {
+      goalRefs.current.delete(goalId);
+    }
+  }, []);
+
+  // re-run line computation after refs are attached
+  useEffect(() => {
+    computeLines();
+  }, [goals, computeLines]);
+
+  const allPlaced = goals.length > 0 && rows.some((row) => row.long.length + row.month.length + row.week.length > 0);
+
+  return (
+    <div className="goal-graph" ref={graphRef}>
+      <svg className="goal-lines">
+        {lines.map((line) => {
+          const isHovered =
+            hoveredGoalId && (connectedIds.has(line.parentId) || connectedIds.has(line.childId));
+          return (
+            <path
+              key={line.key}
+              d={line.d}
+              className={`goal-line${isHovered ? " highlighted" : ""}`}
+            />
+          );
+        })}
+      </svg>
+
+      <div className="goal-graph-columns">
+        {["long", "month", "week"].map((type) => (
+          <div className="goal-graph-col" key={type}>
+            <div className="goal-graph-col-header">
               <span>{goalTypeLabel[type]}</span>
-              <strong>{items.length}</strong>
+              <strong>{goals.filter((g) => g.type === type).length}</strong>
             </div>
-            {items.length === 0 && <EmptyState icon={<Target size={22} />} text={`还没有${goalTypeLabel[type]}目标。`} />}
-            {items.map((goal) => (
-              <article className={`goal-card ${goal.status}`} key={goal.id}>
-                <div>
-                  <strong>{goal.title}</strong>
-                  <span>{priorityLabel[goal.priority]}优先级</span>
-                </div>
-                <div className="goal-actions">
-                  <button
-                    className={goal.status === "active" ? "active" : ""}
-                    onClick={() => updateGoal(goal.id, { status: "active" })}
-                  >
-                    进行
-                  </button>
-                  <button
-                    className={goal.status === "paused" ? "active" : ""}
-                    onClick={() => updateGoal(goal.id, { status: "paused" })}
-                  >
-                    暂停
-                  </button>
-                  <button
-                    className={goal.status === "done" ? "active" : ""}
-                    onClick={() => updateGoal(goal.id, { status: "done" })}
-                  >
-                    完成
-                  </button>
-                </div>
-              </article>
-            ))}
           </div>
         ))}
-      </section>
+      </div>
+
+      <div className="goal-graph-rows">
+        {allPlaced ? (
+          rows.map((row, ri) => (
+            <div className="goal-graph-row" key={ri}>
+              {["long", "month", "week"].map((type) => (
+                <div className="goal-graph-cell" key={type}>
+                  {row[type].map((goal) => {
+                    const isConnected = hoveredGoalId && connectedIds.has(goal.id);
+                    const isDimmed = hoveredGoalId && !isConnected;
+                    const isEditing = editingGoalId === goal.id;
+                    const progress = Number(goal.progress) || 0;
+
+                    if (isEditing) {
+                      return (
+                        <article className="goal-card editing" key={goal.id}>
+                          <div className="goal-edit-form">
+                            <input
+                              value={editDraft.title}
+                              onChange={(e) => setEditDraft((d) => ({ ...d, title: e.target.value }))}
+                              placeholder="目标标题"
+                            />
+                            <div className="goal-edit-row">
+                              <select
+                                value={editDraft.priority}
+                                onChange={(e) => setEditDraft((d) => ({ ...d, priority: e.target.value }))}
+                              >
+                                <option value="high">高优先级</option>
+                                <option value="medium">中优先级</option>
+                                <option value="low">低优先级</option>
+                              </select>
+                              <select
+                                value={editDraft.parentId}
+                                onChange={(e) => setEditDraft((d) => ({ ...d, parentId: e.target.value }))}
+                              >
+                                <option value="">无上级目标</option>
+                                {goals
+                                  .filter((g) => {
+                                    if (goal.type === "month") return g.type === "long";
+                                    if (goal.type === "week") return g.type === "month";
+                                    return false;
+                                  })
+                                  .map((g) => (
+                                    <option key={g.id} value={g.id}>
+                                      {g.title}
+                                    </option>
+                                  ))}
+                              </select>
+                            </div>
+                            <div className="goal-edit-actions">
+                              <button className="secondary-action" onClick={() => saveEditingGoal(goal.id)}>
+                                保存
+                              </button>
+                              <button className="secondary-action" onClick={cancelEditingGoal}>取消</button>
+                            </div>
+                          </div>
+                        </article>
+                      );
+                    }
+
+                    const parentGoal = goal.parentId && goalById[goal.parentId];
+                    return (
+                      <article
+                        className={`goal-card ${goal.status} priority-${goal.priority}${
+                          isConnected ? " goal-highlighted" : ""
+                        }${isDimmed ? " goal-dimmed" : ""}`}
+                        key={goal.id}
+                        ref={(el) => setGoalRef(goal.id, el)}
+                        onMouseEnter={() => setHoveredGoalId(goal.id)}
+                        onMouseLeave={() => setHoveredGoalId(null)}
+                      >
+                        <div className="goal-card-header">
+                          <strong className="goal-card-title">{goal.title}</strong>
+                          <select
+                            className="goal-status-select"
+                            value={goal.status}
+                            onChange={(e) => handleStatusChange(goal, e.target.value)}
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            <option value="active">进行</option>
+                            <option value="paused">暂停</option>
+                            <option value="done">完成</option>
+                          </select>
+                          <button
+                            className="goal-card-delete"
+                            title="删除目标"
+                            onClick={(e) => { e.stopPropagation(); deleteGoal(goal.id); }}
+                          >
+                            <Trash2 size={14} />
+                          </button>
+                        </div>
+                        <div className="goal-card-progress-row">
+                          <div className={`goal-progress ${goal.status}`}>
+                            <input
+                              type="range"
+                              min="0"
+                              max="100"
+                              value={progress}
+                              disabled={goal.status === "done"}
+                              style={{
+                                background:
+                                  goal.status === "done"
+                                    ? "#2f7d55"
+                                    : goal.status === "paused"
+                                      ? `linear-gradient(to right, #d99f1a 0%, #d99f1a ${progress}%, #e9eceb ${progress}%)`
+                                      : `linear-gradient(to right, #2f7d55 0%, #2f7d55 ${progress}%, #e9eceb ${progress}%)`,
+                              }}
+                              onChange={(e) => handleProgressChange(goal, e.target.value)}
+                              onClick={(e) => e.stopPropagation()}
+                            />
+                          </div>
+                          <button
+                            className="goal-card-edit"
+                            title="编辑目标"
+                            onClick={(e) => { e.stopPropagation(); startEditingGoal(goal); }}
+                          >
+                            <Pencil size={15} />
+                          </button>
+                        </div>
+                        {parentGoal && (
+                          <span className="parent-goal">
+                            <TargetIcon size={12} />
+                            {parentGoal.title}
+                          </span>
+                        )}
+                      </article>
+                    );
+                  })}
+                </div>
+              ))}
+            </div>
+          ))
+        ) : (
+          <div className="goal-graph-row">
+            {["long", "month", "week"].map((type) => (
+              <div className="goal-graph-cell" key={type}>
+                <EmptyState icon={<TargetIcon size={22} />} text={`还没有${goalTypeLabel[type]}目标。`} />
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
     </div>
   );
 }
