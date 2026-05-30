@@ -180,17 +180,3 @@ npm run preview
 ## 许可证
 
 MIT License
-
-## GitHub 仓库简介建议
-
-如果要在 GitHub 仓库右侧 About 区域填写简介，可以使用：
-
-```text
-AI 引导式任务录入、目标拆解和自动时间规划工具，支持多模型接入与本地数据保存。
-```
-
-推荐 Topics：
-
-```text
-planning productivity task-management time-blocking ai llm react vite pwa local-first
-```
