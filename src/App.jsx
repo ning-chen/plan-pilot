@@ -3771,6 +3771,7 @@ function GoalGraph({ goals, goalById, updateGoal, deleteGoal, goalTypeLabel, Tar
     setEditingGoalId(goal.id);
     setEditDraft({
       title: goal.title,
+      type: goal.type,
       priority: goal.priority,
       parentId: goal.parentId || "",
     });
@@ -3784,6 +3785,7 @@ function GoalGraph({ goals, goalById, updateGoal, deleteGoal, goalTypeLabel, Tar
     if (!editDraft.title.trim()) return;
     updateGoal(goalId, {
       title: editDraft.title.trim(),
+      type: editDraft.type,
       priority: editDraft.priority,
       parentId: editDraft.parentId || "",
     });
@@ -3917,6 +3919,14 @@ function GoalGraph({ goals, goalById, updateGoal, deleteGoal, goalTypeLabel, Tar
                             />
                             <div className="goal-edit-row">
                               <select
+                                value={editDraft.type}
+                                onChange={(e) => setEditDraft((d) => ({ ...d, type: e.target.value, parentId: "" }))}
+                              >
+                                <option value="long">长期</option>
+                                <option value="month">月度</option>
+                                <option value="week">本周</option>
+                              </select>
+                              <select
                                 value={editDraft.priority}
                                 onChange={(e) => setEditDraft((d) => ({ ...d, priority: e.target.value }))}
                               >
@@ -3924,6 +3934,8 @@ function GoalGraph({ goals, goalById, updateGoal, deleteGoal, goalTypeLabel, Tar
                                 <option value="medium">中优先级</option>
                                 <option value="low">低优先级</option>
                               </select>
+                            </div>
+                            <div className="goal-edit-row">
                               <select
                                 value={editDraft.parentId}
                                 onChange={(e) => setEditDraft((d) => ({ ...d, parentId: e.target.value }))}
@@ -3931,8 +3943,8 @@ function GoalGraph({ goals, goalById, updateGoal, deleteGoal, goalTypeLabel, Tar
                                 <option value="">无上级目标</option>
                                 {goals
                                   .filter((g) => {
-                                    if (goal.type === "month") return g.type === "long";
-                                    if (goal.type === "week") return g.type === "month";
+                                    if (editDraft.type === "month") return g.type === "long";
+                                    if (editDraft.type === "week") return g.type === "month";
                                     return false;
                                   })
                                   .map((g) => (

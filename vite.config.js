@@ -9,6 +9,7 @@ const INDEX_FILE = path.join(DATA_DIR, ".index.json");
 const DAILY_DIR = path.join(DATA_DIR, "daily");
 const GOALS_MONTHLY_DIR = path.join(DATA_DIR, "goals", "monthly");
 const GOALS_LONGTERM_DIR = path.join(DATA_DIR, "goals", "longterm");
+const RECURRING_FILE = path.join(DATA_DIR, "recurring.json");
 const PROFILE_FILE = path.resolve("user-profile.json");
 
 function ensureDir(dir) {
@@ -65,6 +66,49 @@ function yearKey(dateStr) {
   return dateStr.slice(0, 4);
 }
 
+function expandRecurring(items, existingBlocks) {
+  if (!Array.isArray(items) || !items.length) return [];
+  const blocks = [];
+  const today = new Date();
+  const existingKeys = new Set(
+    existingBlocks.map((b) => `${b.date}|${b.start}|${b.title || ""}`)
+  );
+
+  items.forEach((item) => {
+    if (!item.dayOfWeek && item.dayOfWeek !== 0) return;
+    const endDate = item.endDate ? new Date(item.endDate) : null;
+    const cursor = new Date(today);
+
+    // expand up to endDate or 1 year from now
+    const limit = endDate && endDate < new Date(today.getFullYear() + 1, today.getMonth(), today.getDate())
+      ? endDate
+      : new Date(today.getFullYear() + 1, today.getMonth(), today.getDate());
+
+    while (cursor <= limit) {
+      if (cursor.getDay() === item.dayOfWeek) {
+        const ds = formatDate(cursor);
+        const key = `${ds}|${item.start}|${item.title}`;
+        if (!existingKeys.has(key)) {
+          blocks.push({
+            id: `rec-${item.id || ""}-${ds}`,
+            date: ds,
+            type: "busy",
+            taskId: "",
+            title: item.title || "",
+            start: item.start,
+            end: item.end,
+            auto: false,
+          });
+          existingKeys.add(key);
+        }
+      }
+      cursor.setDate(cursor.getDate() + 1);
+    }
+  });
+
+  return blocks;
+}
+
 function loadAllData() {
   const result = {};
 
@@ -90,9 +134,16 @@ function loadAllData() {
     }
   }
   result.tasks = tasks;
-  result.blocks = blocks;
   result.dayPlans = dayPlans;
   result.reviews = reviews;
+
+  // recurring
+  const recurring = readJson(RECURRING_FILE) || [];
+  result.recurring = recurring;
+
+  // expand recurring into blocks
+  const recurringBlocks = expandRecurring(recurring, blocks);
+  result.blocks = blocks.concat(recurringBlocks);
 
   // goals
   const goals = [];
@@ -113,6 +164,11 @@ function loadAllData() {
 function saveAllData(data) {
   // config
   writeJson(CONFIG_FILE, { settings: data.settings || {}, ai: data.ai || {} });
+
+  // recurring
+  if (Array.isArray(data.recurring)) {
+    writeJson(RECURRING_FILE, data.recurring);
+  }
 
   // group daily items by week
   const weeks = {};
