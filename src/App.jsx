@@ -7,6 +7,7 @@ import {
   Clock3,
   Download,
   ListChecks,
+  ListTodo,
   Moon,
   Pencil,
   Plus,
@@ -324,10 +325,13 @@ function estimateMinutesForTitle(title, fallback = 45) {
   const text = String(title || "");
   let estimate = Number(fallback) || 45;
 
+  if (/整理|总结|纪要|复盘|行动项|后续|待办|要点/.test(text) && /会|会议|讨论|探讨|汇报|组会|研讨/.test(text)) {
+    return Math.min(Math.max(estimate, 60), 90);
+  }
   if (/初步设计|框架设计|方案设计|课题设计|研究设计|系统设计|方法设计|技术路线|整体方案|架构设计/.test(text)) {
     estimate = Math.max(estimate, 180);
   }
-  if (/多智能体|水文|时序预测|金融|真实.*工程|CCF|论文|省青基|基金|课题/.test(text) && /设计|方案|框架|定义|目标/.test(text)) {
+  if (/研究|论文|基金|申请|课题|项目|产品|系统|平台|课程|报告/.test(text) && /设计|方案|框架|定义|目标/.test(text)) {
     estimate = Math.max(estimate, 180);
   }
   if (/撰写|写作|修改|整合|相关工作|文献|调研/.test(text)) {
@@ -335,6 +339,9 @@ function estimateMinutesForTitle(title, fallback = 45) {
   }
   if (/会议|开会|课题会|组会|研讨会|汇报|会谈/.test(text)) {
     estimate = Math.max(estimate, 60);
+  }
+  if (/打印|复印|扫描/.test(text)) {
+    estimate = Math.min(Math.max(estimate, 15), 30);
   }
   if (/购买|买票|订票|查票|回复|发送/.test(text)) {
     estimate = Math.min(Math.max(estimate, 10), 30);
@@ -381,10 +388,50 @@ function normalizeTaskSuggestions(items, selectedDate) {
     .filter((item) => item.title);
 }
 
+function nextWeekday(dateString, targetDay) {
+  const [year, month, day] = dateString.split("-").map(Number);
+  const date = new Date(year, month - 1, day);
+  const current = date.getDay();
+  let delta = (targetDay - current + 7) % 7;
+  if (delta === 0) delta = 7;
+  return addDays(dateString, delta);
+}
+
+function inferDateFromText(value, selectedDate) {
+  const text = String(value || "").toLowerCase();
+  const absolute = text.match(/\d{4}-\d{2}-\d{2}/);
+  if (absolute) return absolute[0];
+  if (/明天|tomorrow/.test(text)) return addDays(selectedDate, 1);
+  if (/后天/.test(text)) return addDays(selectedDate, 2);
+  if (/下周一|next monday/.test(text)) return nextWeekday(selectedDate, 1);
+  if (/下周二|next tuesday/.test(text)) return nextWeekday(selectedDate, 2);
+  if (/下周三|next wednesday/.test(text)) return nextWeekday(selectedDate, 3);
+  if (/下周四|next thursday/.test(text)) return nextWeekday(selectedDate, 4);
+  if (/下周五|next friday/.test(text)) return nextWeekday(selectedDate, 5);
+  if (/下周六|next saturday/.test(text)) return nextWeekday(selectedDate, 6);
+  if (/下周日|下周天|next sunday/.test(text)) return nextWeekday(selectedDate, 0);
+  if (/下周|next week/.test(text)) return nextWeekday(selectedDate, 1);
+  return selectedDate;
+}
+
+function collectCoachItems(result) {
+  const items = Array.isArray(result?.items) ? result.items : [];
+  const goals = Array.isArray(result?.goals) ? result.goals.map((item) => ({ ...item, kind: "goal" })) : [];
+  const tasks = Array.isArray(result?.tasks) ? result.tasks.map((item) => ({ ...item, kind: "task" })) : [];
+  const busy = Array.isArray(result?.busy)
+    ? result.busy.map((item) => ({ ...item, kind: "busy" }))
+    : Array.isArray(result?.busyBlocks)
+      ? result.busyBlocks.map((item) => ({ ...item, kind: "busy" }))
+      : [];
+  return items.concat(goals, tasks, busy);
+}
+
 function normalizeCoachItems(items, selectedDate) {
   return (Array.isArray(items) ? items : [])
     .map((item) => {
-      if (item.kind === "goal") {
+      const inferredKind = item.kind || (["long", "month", "week"].includes(item.type) ? "goal" : "task");
+
+      if (inferredKind === "goal") {
         return {
           id: uid("coach"),
           kind: "goal",
@@ -392,10 +439,12 @@ function normalizeCoachItems(items, selectedDate) {
           title: String(item.title || "").trim(),
           priority: normalizePriority(item.priority),
           parentId: String(item.parentId || ""),
+          parentTitle: String(item.parentTitle || item.parent || "").trim(),
+          tempId: String(item.tempId || item.id || item.key || item.title || "").trim(),
         };
       }
 
-      if (item.kind === "busy") {
+      if (inferredKind === "busy") {
         const start = /^\d{2}:\d{2}$/.test(item.start) ? item.start : parseTimeInSentence(item.title || "");
         if (!start) return null;
         const end = /^\d{2}:\d{2}$/.test(item.end)
@@ -417,11 +466,157 @@ function normalizeCoachItems(items, selectedDate) {
         title: String(item.title || "").trim(),
         estimateMinutes: estimateMinutesForTitle(item.title, Math.max(10, Number(item.estimateMinutes) || 45)),
         priority: normalizePriority(item.priority),
-        date: /^\d{4}-\d{2}-\d{2}$/.test(item.date) ? item.date : selectedDate,
+        date: inferDateFromText([item.date, item.when, item.horizon, item.scope].filter(Boolean).join(" "), selectedDate),
         goalId: String(item.goalId || ""),
+        goalTitle: String(item.goalTitle || item.goal || "").trim(),
+        tempId: String(item.tempId || item.id || item.key || item.title || "").trim(),
       };
     })
     .filter((item) => item?.title);
+}
+
+function titleBigrams(title) {
+  const compact = normalizeTitle(title).replace(/[^\u4e00-\u9fa5a-z0-9]/g, "");
+  if (compact.length <= 1) return compact ? [compact] : [];
+  const grams = [];
+  for (let index = 0; index < compact.length - 1; index += 1) {
+    grams.push(compact.slice(index, index + 2));
+  }
+  return grams;
+}
+
+function titleLooksDuplicate(a, b) {
+  const left = normalizeTitle(a).replace(/[^\u4e00-\u9fa5a-z0-9]/g, "");
+  const right = normalizeTitle(b).replace(/[^\u4e00-\u9fa5a-z0-9]/g, "");
+  if (!left || !right) return false;
+  if (left === right) return true;
+  if (Math.min(left.length, right.length) >= 8 && (left.includes(right) || right.includes(left))) return true;
+
+  const aGrams = new Set(titleBigrams(a));
+  const bGrams = new Set(titleBigrams(b));
+  if (!aGrams.size || !bGrams.size) return false;
+  const overlap = [...aGrams].filter((gram) => bGrams.has(gram)).length;
+  return overlap / Math.min(aGrams.size, bGrams.size) >= 0.78;
+}
+
+function titlesReferToSameTask(a, b) {
+  const left = String(a || "");
+  const right = String(b || "");
+  const leftNumbers = left.match(/\d+(?:[.:]\d+)?/g) || [];
+  const rightNumbers = right.match(/\d+(?:[.:]\d+)?/g) || [];
+  if (leftNumbers.length && rightNumbers.length && leftNumbers.join("|") !== rightNumbers.join("|")) return false;
+  return titleLooksDuplicate(left, right);
+}
+
+function compactPlannerTasks(tasks, blocks) {
+  const tasksWithoutBusyCommitments = tasks.filter(
+    (task) =>
+      !(
+        task.fixedTime &&
+        blocks.some(
+          (block) =>
+            block.type === "busy" &&
+            block.date === task.date &&
+            titlesReferToSameTask(block.title, task.title),
+        )
+      ),
+  );
+  const { tasks: compactedTasks, canonicalIdByTaskId } = compactTaskList(tasksWithoutBusyCommitments);
+  const taskById = Object.fromEntries(compactedTasks.map((task) => [task.id, task]));
+  const migratedBlocks = blocks
+    .map((block) => {
+      const canonicalTaskId = block.taskId ? canonicalIdByTaskId.get(block.taskId) : "";
+      return canonicalTaskId && canonicalTaskId !== block.taskId ? { ...block, taskId: canonicalTaskId } : block;
+    })
+    .filter((block) => !block.taskId || Boolean(taskById[block.taskId]));
+  const compactedBlocks = [];
+
+  migratedBlocks.forEach((block) => {
+    if (!block.taskId) {
+      compactedBlocks.push(block);
+      return;
+    }
+
+    const task = taskById[block.taskId];
+    const duplicateIndex = compactedBlocks.findIndex((existing) => {
+      if (!existing.taskId || existing.date !== block.date) return false;
+      const existingTask = taskById[existing.taskId];
+      const sameTask = existing.taskId === block.taskId || titlesReferToSameTask(existingTask?.title, task?.title);
+      return sameTask && overlapsAny(existing, block);
+    });
+
+    if (duplicateIndex < 0) {
+      compactedBlocks.push(block);
+      return;
+    }
+
+    const previous = compactedBlocks[duplicateIndex];
+    if (previous.auto && !block.auto) compactedBlocks[duplicateIndex] = block;
+  });
+
+  return { tasks: compactedTasks, blocks: compactedBlocks };
+}
+
+function attachKnownGoalReferences(items, planner) {
+  const duplicateGoalRefs = new Map();
+
+  items.forEach((item) => {
+    if (item.kind !== "goal") return;
+    const existing = planner.goals.find(
+      (goal) => goal.type === item.type && titleLooksDuplicate(goal.title, item.title),
+    );
+    if (!existing) return;
+    [item.tempId, item.id, item.title, normalizeTitle(item.title)].filter(Boolean).forEach((key) => {
+      duplicateGoalRefs.set(String(key), existing.id);
+    });
+  });
+
+  if (!duplicateGoalRefs.size) return items;
+
+  return items.map((item) => {
+    if (item.kind !== "task") return item;
+    const direct = duplicateGoalRefs.get(String(item.goalId || ""));
+    const byTitle = duplicateGoalRefs.get(String(item.goalTitle || "")) || duplicateGoalRefs.get(normalizeTitle(item.goalTitle));
+    return direct || byTitle ? { ...item, goalId: direct || byTitle } : item;
+  });
+}
+
+function filterCoachItems(items, planner) {
+  const keptTasks = [];
+  const keptGoals = [];
+  const keptBusy = [];
+
+  return items.filter((item) => {
+    if (item.kind === "goal") {
+      const duplicateExisting = planner.goals.some(
+        (goal) => goal.type === item.type && titleLooksDuplicate(goal.title, item.title),
+      );
+      const duplicateNew = keptGoals.some((goal) => goal.type === item.type && titleLooksDuplicate(goal.title, item.title));
+      if (duplicateExisting || duplicateNew) return false;
+      keptGoals.push(item);
+      return true;
+    }
+
+    if (item.kind === "busy") {
+      const duplicateExisting = planner.blocks.some(
+        (block) => block.date === item.date && block.type === "busy" && titleLooksDuplicate(block.title, item.title),
+      );
+      const duplicateNew = keptBusy.some((block) => block.date === item.date && titleLooksDuplicate(block.title, item.title));
+      if (duplicateExisting || duplicateNew) return false;
+      keptBusy.push(item);
+      return true;
+    }
+
+    const duplicateExisting = planner.tasks.some(
+      (task) => task.date === item.date && titlesReferToSameTask(task.title, item.title),
+    );
+    const duplicateNew = keptTasks.some(
+      (task) => task.date === item.date && titlesReferToSameTask(task.title, item.title),
+    );
+    if (duplicateExisting || duplicateNew) return false;
+    keptTasks.push(item);
+    return true;
+  });
 }
 
 function normalizeTitle(title) {
@@ -439,32 +634,51 @@ function goalIdentity(goal) {
   return `${goal.parentId || ""}|${goal.type || ""}|${normalizeTitle(goal.title)}`;
 }
 
-function mergeDuplicateTasks(tasks) {
-  const byKey = new Map();
+function mergeTaskFields(previous, current) {
+  const previousIsManual = !previous.goalId;
+  const currentIsManual = !current.goalId;
+  const shouldPreferCurrent =
+    (!previousIsManual && currentIsManual) ||
+    (previous.status !== "done" && current.status === "done") ||
+    (previous.createdAt && current.createdAt && current.createdAt < previous.createdAt && previousIsManual === currentIsManual);
+  const preferred = shouldPreferCurrent ? current : previous;
+  const fallback = shouldPreferCurrent ? previous : current;
+
+  return {
+    ...fallback,
+    ...preferred,
+    id: previous.id,
+    goalId: preferred.goalId || fallback.goalId || "",
+    status: previous.status === "done" || current.status === "done" ? "done" : preferred.status,
+  };
+}
+
+function compactTaskList(tasks) {
+  const compacted = [];
+  const canonicalIdByTaskId = new Map();
 
   tasks.forEach((task) => {
-    const key = taskIdentity(task);
     if (!normalizeTitle(task.title)) return;
+    const duplicateIndex = compacted.findIndex(
+      (existing) => existing.date === task.date && titlesReferToSameTask(existing.title, task.title),
+    );
 
-    const previous = byKey.get(key);
-    if (!previous) {
-      byKey.set(key, task);
+    if (duplicateIndex < 0) {
+      compacted.push(task);
+      canonicalIdByTaskId.set(task.id, task.id);
       return;
     }
 
-    const previousIsManual = !previous.goalId;
-    const currentIsManual = !task.goalId;
-    const shouldPreferCurrent =
-      (!previousIsManual && currentIsManual) ||
-      (previous.status !== "done" && task.status === "done") ||
-      (previous.createdAt && task.createdAt && task.createdAt < previous.createdAt && previousIsManual === currentIsManual);
-
-    if (shouldPreferCurrent) {
-      byKey.set(key, { ...task, status: previous.status === "done" ? "done" : task.status });
-    }
+    const canonical = compacted[duplicateIndex];
+    compacted[duplicateIndex] = mergeTaskFields(canonical, task);
+    canonicalIdByTaskId.set(task.id, canonical.id);
   });
 
-  return [...byKey.values()];
+  return { tasks: compacted, canonicalIdByTaskId };
+}
+
+function mergeDuplicateTasks(tasks) {
+  return compactTaskList(tasks).tasks;
 }
 
 function filterBreakdownItems(items, planner, goal) {
@@ -476,7 +690,10 @@ function filterBreakdownItems(items, planner, goal) {
   return items.filter((item) => {
     if (item.kind === "task") {
       const key = taskIdentity(item);
-      if (!normalizeTitle(item.title) || taskKeys.has(key) || nextTaskKeys.has(key)) return false;
+      const duplicateExisting = planner.tasks.some(
+        (task) => task.date === item.date && titlesReferToSameTask(task.title, item.title),
+      );
+      if (!normalizeTitle(item.title) || taskKeys.has(key) || nextTaskKeys.has(key) || duplicateExisting) return false;
       nextTaskKeys.add(key);
       return true;
     }
@@ -490,12 +707,18 @@ function filterBreakdownItems(items, planner, goal) {
 
 function filterTaskSuggestions(suggestions, existingTasks) {
   const taskKeys = new Set(existingTasks.map(taskIdentity));
-  const nextTaskKeys = new Set();
+  const kept = [];
 
   return suggestions.filter((task) => {
     const key = taskIdentity(task);
-    if (!normalizeTitle(task.title) || taskKeys.has(key) || nextTaskKeys.has(key)) return false;
-    nextTaskKeys.add(key);
+    const duplicateExisting = existingTasks.some(
+      (existing) => existing.date === task.date && titlesReferToSameTask(existing.title, task.title),
+    );
+    const duplicateNew = kept.some(
+      (existing) => existing.date === task.date && titlesReferToSameTask(existing.title, task.title),
+    );
+    if (!normalizeTitle(task.title) || taskKeys.has(key) || duplicateExisting || duplicateNew) return false;
+    kept.push(task);
     return true;
   });
 }
@@ -520,6 +743,54 @@ function isPostMeetingTask(title) {
   return /整理|总结|纪要|复盘|行动项|后续|待办|要点/.test(title) && /会|会议|课题|讨论|探讨|汇报|组会|研讨/.test(title);
 }
 
+function isTicketPurchaseTask(title) {
+  return /购买|买票|订票|预订|查票|抢票/.test(String(title || "")) && /票|火车|高铁|车次|航班/.test(String(title || ""));
+}
+
+function hasSharedPlanningObject(a, b) {
+  const left = String(a || "");
+  const right = String(b || "");
+  const anchors = ["项目", "文档", "材料", "课题", "申请", "报告", "子章节", "文献", "框架", "初稿", "火车", "高铁", "车票"];
+  if (anchors.some((word) => left.includes(word) && right.includes(word))) return true;
+
+  const leftTokens = left.match(/[\u4e00-\u9fa5]{2,}/g) || [];
+  return leftTokens.some((token) => token.length >= 3 && right.includes(token));
+}
+
+function shouldScheduleBefore(first, second) {
+  const a = String(first?.title || "");
+  const b = String(second?.title || "");
+
+  if (/打印|复印/.test(a) && /扫描|上传|提交/.test(b) && hasSharedPlanningObject(a, b)) return true;
+  if (/扫描/.test(a) && /上传|提交/.test(b) && hasSharedPlanningObject(a, b)) return true;
+  if (/整理|梳理|确定|大纲|框架|核心观点/.test(a) && /撰写|写作|初稿/.test(b) && hasSharedPlanningObject(a, b)) return true;
+  if (isTicketPurchaseTask(a) && /出发|前往|返回|乘车|赶车/.test(b)) return true;
+
+  return false;
+}
+
+function scheduleUrgencyScore(task) {
+  const title = String(task?.title || "");
+  let score = 0;
+  if (isTicketPurchaseTask(title) && /今天|下午|晚上|火车|高铁|航班/.test(title)) score += 5;
+  if (/提交|上传|打印|扫描|发送/.test(title)) score += 1;
+  if (/准备|确认/.test(title)) score += 0.5;
+  return score;
+}
+
+function compareTasksForScheduling(a, b) {
+  if (shouldScheduleBefore(a, b)) return -1;
+  if (shouldScheduleBefore(b, a)) return 1;
+
+  const urgencyDelta = scheduleUrgencyScore(b) - scheduleUrgencyScore(a);
+  if (urgencyDelta !== 0) return urgencyDelta;
+
+  const priorityDelta = priorityOrder[b.priority] - priorityOrder[a.priority];
+  if (priorityDelta !== 0) return priorityDelta;
+
+  return Number(a.estimateMinutes || 0) - Number(b.estimateMinutes || 0);
+}
+
 function latestMeetingEnd(blocks) {
   const meetingBlocks = blocks.filter((block) => block.type === "busy" && isMeetingSentence(block.title || ""));
   if (!meetingBlocks.length) return null;
@@ -531,15 +802,7 @@ function meetingEndForTask(taskTitle, blocks) {
   if (!meetingBlocks.length) return null;
 
   const title = String(taskTitle || "");
-  const related = meetingBlocks.filter((block) => {
-    const blockTitle = String(block.title || "");
-    return (
-      (/课题/.test(title) && /课题/.test(blockTitle)) ||
-      (/组会/.test(title) && /组会/.test(blockTitle)) ||
-      (/管桐/.test(title) && /管桐/.test(blockTitle)) ||
-      (/教改/.test(title) && /教改/.test(blockTitle))
-    );
-  });
+  const related = meetingBlocks.filter((block) => hasSharedPlanningObject(title, block.title));
 
   return Math.max(...(related.length ? related : meetingBlocks).map((block) => toMinutes(block.end)));
 }
@@ -628,6 +891,43 @@ function extractTimedTasksFromText(text, date, existingTasks = []) {
     });
 }
 
+function isMorningActionSentence(sentence) {
+  if (!sentence) return false;
+  if (isMeetingSentence(sentence) && parseTimeInSentence(sentence)) return false;
+  if (isBusySentence(sentence) && parseTimeInSentence(sentence)) return false;
+  if (isPostMeetingTask(sentence)) return true;
+  if (/会议|开会|课题会|组会|例会|研讨会|监考|考试|上课|答辩|面试/.test(sentence)) return false;
+  if (/购买|买票|订票|预订|查票|抢票|打印|复印|扫描|提交|发送|完成|修改|撰写|整理|准备|确认|联系|回复|阅读|调研|查看|检查|申请|下载|上传|填写/.test(sentence)) {
+    return true;
+  }
+  return false;
+}
+
+function extractActionTasksFromText(text, date, existingTasks = []) {
+  const existingKeys = new Set(existingTasks.map(taskIdentity));
+
+  return String(text || "")
+    .split(/[\n。；;]/)
+    .map(normalizeSentence)
+    .filter(isMorningActionSentence)
+    .map((sentence) => ({
+      id: uid("task"),
+      title: sentence,
+      estimateMinutes: estimateMinutesForTitle(sentence, 45),
+      priority: "medium",
+      goalId: "",
+      date,
+      status: "open",
+      createdAt: new Date().toISOString(),
+    }))
+    .filter((task) => {
+      const key = taskIdentity(task);
+      if (existingKeys.has(key)) return false;
+      existingKeys.add(key);
+      return true;
+    });
+}
+
 async function callPlanningAi({ ai, messages, maxTokens = 1800, json = true }) {
   const response = await fetch("/api/ai/chat", {
     method: "POST",
@@ -704,10 +1004,20 @@ function sortBlocks(blocks) {
   return [...blocks].sort((a, b) => toMinutes(a.start) - toMinutes(b.start));
 }
 
-function getFreeIntervals(settings, fixedBlocks) {
+function getProtectedBreaks(settings) {
+  const workStart = toMinutes(settings.workStart);
+  const workEnd = toMinutes(settings.workEnd);
+  const lunchStart = toMinutes("12:00");
+  const lunchEnd = toMinutes("13:00");
+  if (lunchEnd <= workStart || lunchStart >= workEnd) return [];
+  return [{ start: "12:00", end: "13:00", title: "午休" }];
+}
+
+function getFreeIntervals(settings, fixedBlocks, options = {}) {
   const start = toMinutes(settings.workStart);
   const end = toMinutes(settings.workEnd);
-  const fixed = sortBlocks(fixedBlocks).map((block) => ({
+  const protectedBreaks = options.protectLunch === false ? [] : getProtectedBreaks(settings);
+  const fixed = sortBlocks(fixedBlocks.concat(protectedBreaks)).map((block) => ({
     start: toMinutes(block.start),
     end: toMinutes(block.end),
   }));
@@ -728,6 +1038,28 @@ function getFreeIntervals(settings, fixedBlocks) {
   return intervals.filter((interval) => interval.end > interval.start);
 }
 
+function isInsideWorkWindow(block, settings) {
+  return toMinutes(block.start) >= toMinutes(settings.workStart) && toMinutes(block.end) <= toMinutes(settings.workEnd);
+}
+
+function preparePlannerForScheduling({ tasks, blocks, settings, selectedDate }) {
+  const compacted = compactPlannerTasks(tasks, blocks);
+  const protectedBreaks = getProtectedBreaks(settings);
+  const removedTaskIds = [];
+  const preparedBlocks = compacted.blocks.filter((block) => {
+    if (block.date !== selectedDate || block.auto || block.type === "busy" || !block.taskId) return true;
+    const invalid = !isInsideWorkWindow(block, settings) || overlapsAny(block, protectedBreaks);
+    if (invalid) removedTaskIds.push(block.taskId);
+    return !invalid;
+  });
+
+  return {
+    tasks: compacted.tasks,
+    blocks: preparedBlocks,
+    removedTaskIds,
+  };
+}
+
 function buildAutoBlocks({ tasks, existingBlocks, settings, selectedDate }) {
   const todayBlocks = existingBlocks.filter((block) => block.date === selectedDate);
   const manualBlocks = todayBlocks.filter((block) => !block.auto);
@@ -745,14 +1077,21 @@ function buildAutoBlocks({ tasks, existingBlocks, settings, selectedDate }) {
       !scheduledTaskIds.has(task.id) &&
       !busyTaskTitles.has(normalizeTitle(task.title))
     )
-    .sort((a, b) => priorityOrder[b.priority] - priorityOrder[a.priority])
+    .sort(compareTasksForScheduling)
     .map((task) => {
       const postMeeting = isPostMeetingTask(task.title);
       const meetingEnd = postMeeting ? meetingEndForTask(task.title, manualBlocks) : null;
+      const ambiguousTicketPurchase = isTicketPurchaseTask(task.title) && !parseTimeInSentence(task.title);
 
       return {
         ...task,
-        needsPlacement: postMeeting && !meetingEnd,
+        placementReason: ambiguousTicketPurchase
+          ? "这像是买票任务，但标题里的时间更可能是车次/出发时间，不是你打算买票的执行时间。"
+          : "看起来是会后整理或后续行动，但我没找到对应会议时间。",
+        placementHint: ambiguousTicketPurchase
+          ? "请告诉我你准备什么时候买票，或最晚几点前必须买好，再手动放入时间块。"
+          : "请先添加会议的不可用时间块，或手动指定这个任务的开始时间。",
+        needsPlacement: (postMeeting && !meetingEnd) || ambiguousTicketPurchase,
         earliestStart: postMeeting && meetingEnd ? meetingEnd : toMinutes(settings.workStart),
       };
     });
@@ -766,8 +1105,8 @@ function buildAutoBlocks({ tasks, existingBlocks, settings, selectedDate }) {
       taskId: task.id,
       title: task.title,
       estimateMinutes: Number(task.estimateMinutes) || 30,
-      reason: "看起来是会后整理或后续行动，但我没找到对应会议时间。",
-      hint: "请先添加会议的不可用时间块，或手动指定这个任务的开始时间。",
+      reason: task.placementReason,
+      hint: task.placementHint,
     }));
   const unscheduled = candidates.filter((task) => !task.needsPlacement);
 
@@ -853,6 +1192,7 @@ function App() {
   const [breakdownSuggestions, setBreakdownSuggestions] = useState([]);
   const [aiStatus, setAiStatus] = useState({ loading: false, error: "", message: "" });
   const [aiTaskSuggestions, setAiTaskSuggestions] = useState([]);
+  const [todayAiReply, setTodayAiReply] = useState("");
   const [scheduleQuestions, setScheduleQuestions] = useState([]);
   const [planningCoach, setPlanningCoach] = useState({
     scope: "today",
@@ -871,8 +1211,12 @@ function App() {
 
   useEffect(() => {
     setPlanner((current) => {
-      const tasks = mergeDuplicateTasks(current.tasks);
-      return tasks.length === current.tasks.length ? current : { ...current, tasks };
+      const compacted = compactPlannerTasks(current.tasks, current.blocks);
+      const tasksChanged = compacted.tasks.length !== current.tasks.length;
+      const blocksChanged =
+        compacted.blocks.length !== current.blocks.length ||
+        compacted.blocks.some((block, index) => block !== current.blocks[index]);
+      return tasksChanged || blocksChanged ? { ...current, ...compacted } : current;
     });
   }, [setPlanner]);
 
@@ -1202,22 +1546,82 @@ function App() {
     const type = String(fieldValue(form, "type", blockDraft.type));
     const taskId = String(fieldValue(form, "taskId", blockDraft.taskId || ""));
     const title = String(fieldValue(form, "title", blockDraft.title || "")).trim();
-    if (toMinutes(end) <= toMinutes(start)) return;
-    patchPlanner((current) => ({
-      blocks: current.blocks.concat({
-        id: uid("block"),
-        taskId: type === "busy" ? "" : taskId,
-        title: title || (type === "busy" ? "固定占用" : ""),
-        type,
-        date: selectedDate,
-        start,
-        end,
-        auto: false,
-      }),
-    }));
-    if (taskId) {
-      setScheduleQuestions((questions) => questions.filter((question) => question.taskId !== taskId));
+    if (toMinutes(end) <= toMinutes(start)) {
+      setAiStatus({ loading: false, error: "结束时间需要晚于开始时间。", message: "" });
+      return;
     }
+
+    const compacted = compactPlannerTasks(planner.tasks, planner.blocks);
+    const selectedTask = planner.tasks.find((task) => task.id === taskId);
+    const canonicalTask = taskId
+      ? compacted.tasks.find(
+          (task) => task.id === taskId || (task.date === selectedTask?.date && titlesReferToSameTask(task.title, selectedTask?.title)),
+        )
+      : null;
+    const canonicalTaskId = canonicalTask?.id || taskId;
+    const nextBlock = {
+      id: uid("block"),
+      taskId: type === "busy" ? "" : canonicalTaskId,
+      title: title || (type === "busy" ? "固定占用" : ""),
+      type,
+      date: selectedDate,
+      start,
+      end,
+      auto: false,
+    };
+
+    if (type !== "busy" && !isInsideWorkWindow(nextBlock, planner.settings)) {
+      setAiStatus({ loading: false, error: "任务时间块超出了当前工作时段，请调整时间或先修改工作开始/结束时间。", message: "" });
+      return;
+    }
+    if (type !== "busy" && overlapsAny(nextBlock, getProtectedBreaks(planner.settings))) {
+      setAiStatus({ loading: false, error: "任务时间块与默认午休 12:00-13:00 冲突，请换一个时间。", message: "" });
+      return;
+    }
+
+    const blocksWithoutOverriddenAuto = compacted.blocks.filter(
+      (block) =>
+        !(
+          block.date === selectedDate &&
+          block.auto &&
+          ((canonicalTaskId && block.taskId === canonicalTaskId) || overlapsAny(nextBlock, [block]))
+        ),
+    );
+    const conflict = blocksWithoutOverriddenAuto.find(
+      (block) => block.date === selectedDate && overlapsAny(nextBlock, [block]),
+    );
+    if (conflict) {
+      const conflictTask = compacted.tasks.find((task) => task.id === conflict.taskId);
+      setAiStatus({
+        loading: false,
+        error: `这个时间与“${conflictTask?.title || conflict.title || "已有时间块"}”重叠，请先调整。`,
+        message: "",
+      });
+      return;
+    }
+
+    patchPlanner({
+      tasks: compacted.tasks,
+      blocks: blocksWithoutOverriddenAuto.concat(nextBlock),
+    });
+    setBlockDraft({
+      type: "task",
+      taskId: "",
+      title: "",
+      start: planner.settings.workStart,
+      end: toTime(toMinutes(planner.settings.workStart) + 60),
+    });
+    if (canonicalTaskId) {
+      const scheduledTask = compacted.tasks.find((task) => task.id === canonicalTaskId);
+      setScheduleQuestions((questions) =>
+        questions.filter(
+          (question) =>
+            question.taskId !== canonicalTaskId &&
+            !titlesReferToSameTask(question.title, scheduledTask?.title),
+        ),
+      );
+    }
+    setAiStatus({ loading: false, error: "", message: "已加入手动时间块。再次点击自动安排时，AI 会保留它并重新规划其余任务。" });
   }
 
   function deleteBlock(blockId) {
@@ -1230,6 +1634,42 @@ function App() {
     patchPlanner((current) => ({
       blocks: current.blocks.map((b) => (b.id === blockId ? { ...b, ...patch } : b)),
     }));
+  }
+
+  function updateBlock(blockId, patch) {
+    const existing = planner.blocks.find((block) => block.id === blockId);
+    if (!existing) return false;
+    const nextBlock = { ...existing, ...patch };
+    if (nextBlock.type !== "busy" && !isInsideWorkWindow(nextBlock, planner.settings)) {
+      setAiStatus({ loading: false, error: "任务时间块超出了当前工作时段，请调整时间或先修改工作开始/结束时间。", message: "" });
+      return false;
+    }
+    if (nextBlock.type !== "busy" && overlapsAny(nextBlock, getProtectedBreaks(planner.settings))) {
+      setAiStatus({ loading: false, error: "任务时间块与默认午休 12:00-13:00 冲突，请换一个时间。", message: "" });
+      return false;
+    }
+    const remainingBlocks = planner.blocks.filter(
+      (block) => block.id === blockId || !(block.auto && block.date === nextBlock.date && overlapsAny(nextBlock, [block])),
+    );
+    const conflict = remainingBlocks.find(
+      (block) => block.id !== blockId && block.date === nextBlock.date && overlapsAny(nextBlock, [block]),
+    );
+    if (conflict) {
+      const conflictTask = planner.tasks.find((task) => task.id === conflict.taskId);
+      setAiStatus({
+        loading: false,
+        error: `这个时间与“${conflictTask?.title || conflict.title || "已有时间块"}”重叠，请先调整。`,
+        message: "",
+      });
+      return false;
+    }
+    patchPlanner((current) => ({
+      blocks: current.blocks
+        .filter((block) => block.id === blockId || !(block.auto && block.date === nextBlock.date && overlapsAny(nextBlock, [block])))
+        .map((block) => (block.id === blockId ? { ...block, ...patch } : block)),
+    }));
+    setAiStatus({ loading: false, error: "", message: "时间块已更新。再次点击自动安排时，AI 会据此重新规划其余任务。" });
+    return true;
   }
 
   function updateGoal(goalId, patch) {
@@ -1252,9 +1692,9 @@ function App() {
     if (!goal) return;
     setBreakdownDraft((draft) => ({ ...draft, goalId: goal.id }));
 
-    if (!planner.ai.enabled) {
+    if (!planner.ai.enabled || !planner.ai.apiKey.trim()) {
       setBreakdownSuggestions(filterBreakdownItems(makeBreakdown(goal, breakdownDraft, selectedDate), planner, goal));
-      setAiStatus({ loading: false, error: "", message: "已使用规则拆解。启用 AI 后可改用大模型拆解。" });
+      setAiStatus({ loading: false, error: "", message: "已使用规则拆解。启用 AI 并填写 Key 后，可改用大模型拆解。" });
       return;
     }
 
@@ -1367,9 +1807,11 @@ function App() {
     setBreakdownSuggestions([]);
   }
 
-  async function generateTodayAiGuide() {
-    if (!planner.ai.enabled) {
-      setAiStatus({ loading: false, error: "请先在左侧启用 AI。", message: "" });
+  async function generateTodayAiGuide(extraAnswer = "") {
+    const followUpAnswer = typeof extraAnswer === "string" ? extraAnswer.trim() : "";
+
+    if (!planner.ai.enabled || !planner.ai.apiKey.trim()) {
+      setAiStatus({ loading: false, error: "请先在左侧启用 AI 并填写当前服务商的 API Key。", message: "" });
       return;
     }
 
@@ -1398,6 +1840,11 @@ function App() {
           {
             role: "system",
             content:
+              "When a task is about buying or booking tickets, distinguish the travel/departure time from the execution time. Ask '你打算什么时候买票/最晚几点前买好？' instead of only asking '买什么时候的票'. Respect task dependencies: print before scan/upload/submit, scan before upload, outline/framework/core points before drafting. If dependency order is unclear, ask a follow-up question rather than generating a contradictory schedule.",
+          },
+          {
+            role: "system",
+            content:
               "Estimate time conservatively. For tasks involving 初步设计, 框架设计, 方案设计, 技术路线, 多智能体方法设计, 论文/项目方案, or research proposal writing, use at least 180 minutes unless the user explicitly says it is a quick note. Do not compress complex design work into 60 or 90 minutes.",
           },
           {
@@ -1416,6 +1863,8 @@ function App() {
               })),
               timeBlocks: todayBlocks.map(({ title, taskId, type, start, end, auto }) => ({ title, taskId, type, start, end, auto })),
               doNotRepeatTaskTitles: todayTasks.map((task) => task.title),
+              previousAiQuestion: followUpAnswer ? aiStatus.message : "",
+              followUpAnswer,
             }),
           },
         ],
@@ -1444,6 +1893,14 @@ function App() {
     }
   }
 
+  function sendTodayAiReply(event) {
+    event.preventDefault();
+    const reply = todayAiReply.trim();
+    if (!reply || aiStatus.loading) return;
+    setTodayAiReply("");
+    generateTodayAiGuide(reply);
+  }
+
   function acceptAiTaskSuggestions() {
     if (!aiTaskSuggestions.length) return;
     patchPlanner((current) => ({
@@ -1466,11 +1923,11 @@ function App() {
   }
 
   async function runPlanningCoach(nextMessages) {
-    if (!planner.ai.enabled) {
+    if (!planner.ai.enabled || !planner.ai.apiKey.trim()) {
       setPlanningCoach((coach) => ({
         ...coach,
         loading: false,
-        error: "请先在左侧启用 AI。",
+        error: "请先在左侧启用 AI 并填写当前服务商的 API Key。",
       }));
       return;
     }
@@ -1486,12 +1943,22 @@ function App() {
           {
             role: "system",
             content:
-              "You are an active planning coach. Interview the user to add and break down today, this week, monthly, or long-term work. If you need more information, ask one concise question in natural Chinese. When you have enough information to add plan items, prefer JSON: {\"message\":\"question or summary\",\"done\":false,\"items\":[{\"kind\":\"goal\",\"type\":\"long|month|week\",\"title\":\"...\",\"priority\":\"high|medium|low\",\"parentId\":\"optional\"},{\"kind\":\"task\",\"date\":\"YYYY-MM-DD\",\"title\":\"...\",\"estimateMinutes\":60,\"priority\":\"high|medium|low\",\"goalId\":\"optional\"},{\"kind\":\"busy\",\"date\":\"YYYY-MM-DD\",\"title\":\"...\",\"start\":\"HH:MM\",\"end\":\"HH:MM\"}]}. Do not duplicate existing tasks or goals. Estimate durations realistically: research framework design, project design, technical route, multi-agent method design, or thesis/proposal writing usually needs at least 180 minutes unless the user says it is tiny.",
+              "You are an active planning coach. Interview the user to add and break down today, this week, monthly, or long-term work. If you need more information, ask one concise question in natural Chinese. When you have enough information, prefer JSON: {\"message\":\"summary\",\"done\":false,\"items\":[{\"kind\":\"goal\",\"tempId\":\"g1\",\"type\":\"long|month|week\",\"title\":\"...\",\"priority\":\"high|medium|low\",\"parentId\":\"existing id or tempId\",\"parentTitle\":\"optional\"},{\"kind\":\"task\",\"date\":\"YYYY-MM-DD\",\"title\":\"...\",\"estimateMinutes\":60,\"priority\":\"high|medium|low\",\"goalId\":\"existing id or tempId\",\"goalTitle\":\"optional\"},{\"kind\":\"busy\",\"date\":\"YYYY-MM-DD\",\"title\":\"...\",\"start\":\"HH:MM\",\"end\":\"HH:MM\"}]}. Use absolute dates for future tasks. If an item is not tied to a specific date, make it a week/month/long goal rather than a task. Do not duplicate existing tasks or goals. Estimate durations realistically: research framework design, project design, technical route, multi-agent method design, or thesis/proposal writing usually needs at least 180 minutes unless the user says it is tiny.",
           },
           {
             role: "system",
             content:
               "Conversation policy: after each user answer, decide whether one more key question is needed or whether actionable items can be proposed. Do not repeat the user's own text as a new task unless it is truly new. When proposing items, include dependencies and fixed-time commitments as busy blocks, and make meeting preparation happen before the meeting and meeting summary/follow-up after the meeting.",
+            },
+            {
+              role: "system",
+              content:
+                "For long-scope interviews, propose a small hierarchy instead of a flat task dump: one long goal if missing, one or two month/week goals, and only the next dated tasks. Keep proposals compact, usually 4-8 items. Existing tasks and goals are context only; if something already exists, reference it by id/title but do not output it again.",
+            },
+            {
+              role: "system",
+              content:
+              "For ticket-buying tasks, ask when the user will execute the purchase or the latest acceptable purchase time; do not confuse that with the train/flight departure time. Preserve dependencies such as print before scan/upload/submit and outline/framework before drafting.",
           },
           {
             role: "user",
@@ -1500,7 +1967,7 @@ function App() {
               interviewScope: planningCoach.scope,
               dayPlan,
               existingGoals: planner.goals.map(({ id, title, type, parentId, status }) => ({ id, title, type, parentId, status })),
-              todayTasks: todayTasks.map(({ title, date, estimateMinutes, priority, status, goalId }) => ({
+              existingTasks: planner.tasks.map(({ title, date, estimateMinutes, priority, status, goalId }) => ({
                 title,
                 date,
                 estimateMinutes,
@@ -1509,6 +1976,8 @@ function App() {
                 goalId,
               })),
               timeBlocks: todayBlocks.map(({ title, type, start, end, taskId }) => ({ title, type, start, end, taskId })),
+              doNotRepeatTaskTitles: planner.tasks.map((task) => task.title),
+              doNotRepeatGoalTitles: planner.goals.map((goal) => goal.title),
             }),
           },
           ...nextMessages.map((message) => ({
@@ -1518,7 +1987,8 @@ function App() {
         ],
       });
 
-      const items = normalizeCoachItems(result.items, selectedDate);
+      const normalizedItems = attachKnownGoalReferences(normalizeCoachItems(collectCoachItems(result), selectedDate), planner);
+      const items = filterCoachItems(normalizedItems, planner);
       setPlanningCoach((coach) => ({
         ...coach,
         loading: false,
@@ -1555,19 +2025,40 @@ function App() {
   function acceptPlanningCoachSuggestions() {
     if (!planningCoach.suggestions.length) return;
 
-    patchPlanner((current) => {
+    function prepareAcceptance(current) {
       const validGoalIds = new Set(current.goals.map((goal) => goal.id));
-      const goalItems = planningCoach.suggestions.filter((item) => item.kind === "goal");
-      const taskItems = planningCoach.suggestions.filter((item) => item.kind === "task");
-      const busyItems = planningCoach.suggestions.filter((item) => item.kind === "busy");
+      const filteredSuggestions = filterCoachItems(planningCoach.suggestions, current);
+      const goalItems = filteredSuggestions.filter((item) => item.kind === "goal");
+      const taskItems = filteredSuggestions.filter((item) => item.kind === "task");
+      const busyItems = filteredSuggestions.filter((item) => item.kind === "busy");
       const existingGoalKeys = new Set(current.goals.map(goalIdentity));
+      const existingGoalByTitle = new Map(current.goals.map((goal) => [normalizeTitle(goal.title), goal.id]));
+      const preparedGoals = goalItems.map((item) => ({ ...item, newId: uid("goal") }));
+      const suggestedGoalIdMap = new Map();
 
-      const goals = goalItems
+      preparedGoals.forEach((item) => {
+        if (item.tempId) suggestedGoalIdMap.set(item.tempId, item.newId);
+        suggestedGoalIdMap.set(item.title, item.newId);
+        suggestedGoalIdMap.set(normalizeTitle(item.title), item.newId);
+      });
+
+      function resolveGoalReference(reference, title) {
+        const value = String(reference || "").trim();
+        const normalized = normalizeTitle(title || value);
+        if (validGoalIds.has(value)) return value;
+        if (suggestedGoalIdMap.has(value)) return suggestedGoalIdMap.get(value);
+        if (suggestedGoalIdMap.has(normalized)) return suggestedGoalIdMap.get(normalized);
+        if (existingGoalByTitle.has(normalized)) return existingGoalByTitle.get(normalized);
+        const similarExisting = current.goals.find((goal) => titleLooksDuplicate(goal.title, title || value));
+        return similarExisting?.id || "";
+      }
+
+      const goals = preparedGoals
         .map((item) => ({
-          id: uid("goal"),
+          id: item.newId,
           title: item.title,
           type: item.type,
-          parentId: validGoalIds.has(item.parentId) ? item.parentId : "",
+          parentId: resolveGoalReference(item.parentId, item.parentTitle),
           priority: item.priority,
           status: "active",
           progress: 0,
@@ -1586,7 +2077,7 @@ function App() {
           estimateMinutes: item.estimateMinutes,
           priority: item.priority,
           date: item.date,
-          goalId: validGoalIds.has(item.goalId) ? item.goalId : "",
+          goalId: resolveGoalReference(item.goalId, item.goalTitle),
         })),
         current.tasks,
       ).map((item) => ({
@@ -1612,13 +2103,39 @@ function App() {
       }));
 
       return {
-        goals: current.goals.concat(goals),
-        tasks: mergeDuplicateTasks(current.tasks.concat(tasks)),
-        blocks: current.blocks.concat(blocks),
+        goals,
+        tasks,
+        blocks,
+        summary: {
+          goals: goals.length,
+          tasks: tasks.length,
+          todayTasks: tasks.filter((task) => task.date === selectedDate).length,
+          futureTasks: tasks.filter((task) => task.date !== selectedDate).length,
+          busy: blocks.length,
+        },
+      };
+    }
+
+    const acceptance = prepareAcceptance(planner);
+
+    patchPlanner((current) => {
+      const prepared = current === planner ? acceptance : prepareAcceptance(current);
+      return {
+        goals: current.goals.concat(prepared.goals),
+        tasks: mergeDuplicateTasks(current.tasks.concat(prepared.tasks)),
+        blocks: current.blocks.concat(prepared.blocks),
       };
     });
 
-    setPlanningCoach((coach) => ({ ...coach, suggestions: [] }));
+    const { summary } = acceptance;
+    setPlanningCoach((coach) => ({
+      ...coach,
+      suggestions: [],
+      messages: coach.messages.concat({
+        role: "assistant",
+        content: `已加入计划：${summary.goals} 个目标、${summary.tasks} 个任务（今日 ${summary.todayTasks} 个，后续 ${summary.futureTasks} 个）、${summary.busy} 个固定安排。后续任务可在“目标”页的后续任务区查看。`,
+      }),
+    }));
   }
 
   function exportData() {
@@ -1630,6 +2147,29 @@ function App() {
     link.download = `plan-pilot-${getLocalDate()}.json`;
     link.click();
     URL.revokeObjectURL(url);
+  }
+
+  function resetLocalData() {
+    if (!window.confirm("确定清空当前浏览器中的目标、任务、时间块、复盘记录和本地 API Key 吗？此操作无法撤销。")) return;
+    setPlanner(hydrateState(defaultState));
+    setSelectedDate(getLocalDate());
+    setTaskDraft({ title: "", estimateMinutes: 60, priority: "medium", goalId: "" });
+    setBlockDraft({ type: "task", taskId: "", title: "", start: defaultState.settings.workStart, end: "10:00" });
+    setBreakdownDraft({ goalId: "", outcome: "", deadline: "", constraints: "" });
+    setBreakdownSuggestions([]);
+    setAiStatus({ loading: false, error: "", message: "本地数据已清空。" });
+    setAiTaskSuggestions([]);
+    setTodayAiReply("");
+    setScheduleQuestions([]);
+    setPlanningCoach({
+      scope: "today",
+      messages: [],
+      input: "",
+      suggestions: [],
+      loading: false,
+      error: "",
+    });
+    setReviewDraft({ completed: "", blockers: "", adjustments: "", tomorrowFocus: "" });
   }
 
   function importData(event) {
@@ -1826,22 +2366,25 @@ function App() {
               {aiKeyLoaded ? "已加载" : "未配置"}
             </span>
           </label>
-          <label>
-            模型
-            <input
-              value={planner.ai.model}
-              onChange={(event) => updateAiSettings({ model: event.target.value })}
-              placeholder={currentAiPreset.model || "model-id"}
-            />
-          </label>
-          <label>
-            API 地址
-            <input
-              value={planner.ai.baseUrl}
-              onChange={(event) => updateAiSettings({ baseUrl: event.target.value })}
-              placeholder={currentAiPreset.baseUrl || "https://api.example.com/v1"}
-            />
-          </label>
+          <details className="ai-advanced">
+            <summary>高级设置</summary>
+            <label>
+              模型
+              <input
+                value={planner.ai.model}
+                onChange={(event) => updateAiSettings({ model: event.target.value })}
+                placeholder={currentAiPreset.model || "model-id"}
+              />
+            </label>
+            <label>
+              API 地址
+              <input
+                value={planner.ai.baseUrl}
+                onChange={(event) => updateAiSettings({ baseUrl: event.target.value })}
+                placeholder={currentAiPreset.baseUrl || "https://api.example.com/v1"}
+              />
+            </label>
+          </details>
           <p>
             当前协议：{planner.ai.protocol === "anthropic" ? "Anthropic Messages" : "OpenAI 兼容"}。Key
             只保存在本机浏览器，本地原型会通过当前 dev server 代理请求。
@@ -1859,6 +2402,10 @@ function App() {
             导入 JSON
             <input type="file" accept="application/json" onChange={importData} />
           </label>
+          <button className="danger-data" onClick={resetLocalData}>
+            <Trash2 size={16} />
+            清空本地数据
+          </button>
         </section>
       </aside>
 
@@ -1951,6 +2498,8 @@ function App() {
         {activeView === "goals" && (
           <GoalsView
             goals={planner.goals}
+            tasks={planner.tasks}
+            selectedDate={selectedDate}
             goalDraft={goalDraft}
             setGoalDraft={setGoalDraft}
             addGoal={addGoal}
@@ -2150,6 +2699,21 @@ function TodayView({
           {aiStatus.message && <span className="ai-message">{aiStatus.message}</span>}
           {aiStatus.error && <span className="ai-error">{aiStatus.error}</span>}
         </div>
+        {showAiFollowUp && (
+          <form className="ai-followup-form" onSubmit={sendTodayAiReply}>
+            <textarea
+              value={todayAiReply}
+              onChange={(event) => setTodayAiReply(event.target.value)}
+              placeholder="在这里回答 AI 的追问，例如：会议 15:00 开始；文档完成后需要提交；剩余时间优先推进方案修改。"
+            />
+            <div className="ai-followup-actions">
+              <button className="secondary-action" disabled={!todayAiReply.trim()}>
+                <Send size={18} />
+                发送回答并继续生成
+              </button>
+            </div>
+          </form>
+        )}
         {aiTaskSuggestions.length > 0 && (
           <div className="ai-suggestion-list">
             {aiTaskSuggestions.map((task) => (
@@ -2424,9 +2988,9 @@ function TodayView({
             <p className="eyebrow">时间分配</p>
             <h2>{planner.settings.workStart} - {planner.settings.workEnd}</h2>
           </div>
-          <button className="secondary-action" onClick={autoSchedule}>
+          <button className="secondary-action" onClick={autoSchedule} disabled={aiStatus.loading}>
             <AlarmClock size={18} />
-            自动安排
+            {aiStatus.loading ? "正在重新规划" : "自动安排"}
           </button>
         </div>
 
@@ -2503,15 +3067,7 @@ function TodayView({
                 <button
                   type="button"
                   className="secondary-action"
-                  onClick={() =>
-                    setBlockDraft((draft) => ({
-                      ...draft,
-                      type: "task",
-                      taskId: question.taskId,
-                      title: "",
-                      end: toTime(toMinutes(draft.start) + question.estimateMinutes),
-                    }))
-                  }
+                  onClick={() => fillScheduleQuestion(question)}
                 >
                   放入手动表单
                 </button>
@@ -2597,6 +3153,8 @@ function TodayView({
 
 function GoalsView({
   goals,
+  tasks,
+  selectedDate,
   goalDraft,
   setGoalDraft,
   addGoal,
@@ -2616,6 +3174,9 @@ function GoalsView({
     if (goalDraft.type === "month") return goal.type === "long";
     return goal.type === "month";
   });
+  const futureTasks = tasks
+    .filter((task) => task.status !== "done" && task.date !== selectedDate)
+    .sort((a, b) => a.date.localeCompare(b.date) || priorityOrder[b.priority] - priorityOrder[a.priority]);
 
   return (
     <div className="goals-layout">
@@ -2737,6 +3298,34 @@ function GoalsView({
               加入计划
             </button>
           </div>
+        )}
+      </section>
+
+      <section className="panel future-task-panel">
+        <div className="section-heading">
+          <div>
+            <p className="eyebrow">后续任务</p>
+            <h2>今天之外的已拆解事项</h2>
+          </div>
+        </div>
+        {futureTasks.length > 0 ? (
+          <div className="future-task-list">
+            {futureTasks.map((task) => {
+              const linkedGoal = task.goalId ? goalById[task.goalId] : null;
+              return (
+                <article className="future-task-item" key={task.id}>
+                  <span>{formatHumanDate(task.date)}</span>
+                  <strong>{task.title}</strong>
+                  <em>
+                    {priorityLabel[task.priority]} · {task.estimateMinutes} 分钟
+                    {linkedGoal ? ` · ${linkedGoal.title}` : ""}
+                  </em>
+                </article>
+              );
+            })}
+          </div>
+        ) : (
+          <EmptyState icon={<ListTodo size={22} />} text="还没有今天之外的后续任务。" />
         )}
       </section>
 

@@ -47,7 +47,7 @@ textarea {
   color: #f7f4ec;
   display: flex;
   flex-direction: column;
-  gap: 28px;
+  gap: 18px;
   padding: 24px;
   overflow-y: auto;
 }
@@ -107,10 +107,14 @@ textarea {
 
 .settings-panel {
   display: grid;
-  gap: 12px;
-  margin-top: auto;
-  padding-top: 20px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  padding-top: 14px;
   border-top: 1px solid rgba(255, 255, 255, 0.14);
+}
+
+.settings-panel label:last-child {
+  grid-column: 1 / -1;
 }
 
 .settings-panel label {
@@ -131,8 +135,8 @@ textarea {
 
 .ai-panel {
   display: grid;
-  gap: 10px;
-  padding-top: 18px;
+  gap: 8px;
+  padding-top: 14px;
   border-top: 1px solid rgba(255, 255, 255, 0.14);
 }
 
@@ -205,6 +209,27 @@ textarea {
   color: #f4d35e;
 }
 
+.ai-advanced {
+  display: grid;
+  gap: 8px;
+}
+
+.ai-advanced summary {
+  color: #f4d35e;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.ai-advanced[open] {
+  display: grid;
+  gap: 8px;
+}
+
+.ai-advanced label {
+  margin-top: 8px;
+}
+
 .ai-toggle {
   grid-template-columns: 18px 1fr;
   align-items: center;
@@ -237,6 +262,11 @@ textarea {
 
 .data-panel input {
   display: none;
+}
+
+.data-panel .danger-data {
+  border-color: rgba(255, 180, 160, 0.46);
+  color: #ffd2c6;
 }
 
 .workspace {
@@ -445,6 +475,21 @@ textarea {
   align-items: center;
   flex-wrap: wrap;
   gap: 10px;
+}
+
+.ai-followup-form {
+  display: grid;
+  gap: 10px;
+}
+
+.ai-followup-form textarea {
+  min-height: 82px;
+}
+
+.ai-followup-actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
 }
 
 .ai-message,
@@ -684,6 +729,10 @@ textarea {
   grid-column: 1 / -1;
 }
 
+.future-task-panel {
+  grid-column: 1 / -1;
+}
+
 .breakdown-form {
   grid-template-columns: minmax(180px, 0.8fr) minmax(220px, 1fr) 150px 150px;
 }
@@ -698,9 +747,10 @@ textarea {
   gap: 10px;
 }
 
-.breakdown-item {
+.breakdown-item,
+.future-task-item {
   display: grid;
-  grid-template-columns: 110px minmax(0, 1fr) 110px;
+  grid-template-columns: 110px minmax(0, 1fr) minmax(150px, 0.42fr);
   gap: 10px;
   align-items: center;
   min-height: 54px;
@@ -711,16 +761,24 @@ textarea {
 }
 
 .breakdown-item span,
-.breakdown-item em {
+.breakdown-item em,
+.future-task-item span,
+.future-task-item em {
   color: #69736f;
   font-size: 13px;
   font-style: normal;
 }
 
-.breakdown-item strong {
+.breakdown-item strong,
+.future-task-item strong {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.future-task-list {
+  display: grid;
+  gap: 10px;
 }
 
 .icon-button.solid {
@@ -1015,6 +1073,29 @@ textarea {
 .time-block.busy {
   border-left: 4px solid #b83b2c;
   background: #fff7f3;
+}
+
+.time-block.editing {
+  grid-template-columns: 1fr;
+  align-items: stretch;
+  background: #fbf9f4;
+}
+
+.edit-block-form {
+  display: grid;
+  gap: 10px;
+}
+
+.edit-block-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.9fr) minmax(160px, 1.2fr) minmax(160px, 1fr) 110px 110px;
+  gap: 10px;
+}
+
+.edit-block-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .time-range {
@@ -1474,6 +1555,11 @@ textarea {
     grid-template-columns: 1fr;
   }
 
+  .breakdown-item,
+  .future-task-item {
+    grid-template-columns: 1fr;
+  }
+
   .task-item {
     grid-template-columns: 40px minmax(0, 1fr) 40px 40px;
   }
@@ -1490,5 +1576,8 @@ textarea {
   .goal-edit-row {
     grid-template-columns: 1fr;
   }
+
+  .edit-block-row {
+    grid-template-columns: 1fr;
   }
 }
