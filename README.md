@@ -156,6 +156,27 @@ npm run preview
 └── README.md
 ```
 
+## 开机自启动
+
+### Windows
+
+1. 创建 `startup.bat`：
+   ```bat
+   @echo off
+   cd /d <项目路径>
+   start "" http://127.0.0.1:5174
+   npx vite --host 127.0.0.1 --port 5174
+   ```
+   将 `<项目路径>` 替换为本项目实际路径。
+
+2. 按 `Win + R`，输入 `shell:startup`，回车打开启动文件夹。
+
+3. 右键 → 新建快捷方式 → 选择 `startup.bat` → 下一步 → 完成。
+
+下次开机即自动在 `http://127.0.0.1:5174` 启动计划引航。
+
+> 可将 `startup.bat` 加入 `.gitignore`，避免将本地路径提交到仓库。
+
 ## 许可证
 
 MIT License

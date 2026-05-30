@@ -165,6 +165,42 @@ textarea {
   font-size: 12px;
 }
 
+.key-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 40px;
+  padding: 0 12px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.key-status::before {
+  content: "";
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+
+.key-status.loaded {
+  background: #d9ece2;
+  color: #255544;
+}
+
+.key-status.loaded::before {
+  background: #2f7d55;
+}
+
+.key-status.missing {
+  background: #fff2df;
+  color: #8a4c2b;
+}
+
+.key-status.missing::before {
+  background: #d99f1a;
+}
+
 .ai-provider-note {
   color: #f4d35e;
 }
@@ -292,6 +328,40 @@ textarea {
   height: 40px;
 }
 
+.topbar-highlights {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+}
+
+.topbar-highlight {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 26px;
+  padding: 3px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.topbar-highlight.week {
+  background: #fce4dc;
+  color: #b85c3a;
+}
+
+.topbar-highlight.month {
+  background: #d9ece2;
+  color: #255544;
+}
+
+.topbar-highlight.busy {
+  background: #e0ddef;
+  color: #4a3a7a;
+}
+
 .flip {
   transform: rotate(180deg);
 }
@@ -312,7 +382,7 @@ textarea {
 .today-grid.layout-done .schedule-panel { order: 2; }
 .today-grid.layout-done .interview-panel { order: 3; }
 .today-grid.layout-done .coach-band { order: 4; }
-.today-grid.layout-done .stats-row { display: none; }
+.today-grid.layout-done .stats-row { order: 0; }
 
 .coach-band,
 .stats-row,
@@ -329,9 +399,20 @@ textarea {
   padding: 22px;
 }
 
+.coach-copy {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.question-grid textarea {
+  min-height: 120px;
+}
+
 .question-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 14px;
 }
 
@@ -348,25 +429,15 @@ textarea {
   color: #303a36;
 }
 
-.energy-picker {
-  display: grid;
-  gap: 8px;
-  align-content: start;
-  font-weight: 700;
-}
-
-.energy-picker button {
+.energy-select {
   min-height: 38px;
+  padding: 6px 12px;
   border: 1px solid #d8d0bf;
   border-radius: 8px;
-  background: #fbf6e8;
-  color: #38433f;
-}
-
-.energy-picker button.active {
-  border-color: #2f5148;
-  background: #d9ece2;
-  color: #20332f;
+  background: #fffdf7;
+  font-weight: 700;
+  font-size: 14px;
+  cursor: pointer;
 }
 
 .ai-guide-actions {
@@ -570,15 +641,23 @@ textarea {
 }
 
 .task-form {
-  grid-template-columns: minmax(0, 1fr) 96px;
+  grid-template-columns: 96px 120px minmax(140px, 1fr) auto;
 }
 
 .task-form > input:first-child {
   grid-column: 1 / -1;
 }
 
+.task-form > input[name="estimateMinutes"] {
+  grid-column: auto;
+}
+
+.task-form > select[name="priority"] {
+  grid-column: auto;
+}
+
 .task-form > select[name="goalId"] {
-  grid-column: 1 / 2;
+  grid-column: auto;
 }
 
 .block-form {
@@ -718,6 +797,22 @@ textarea {
 
 .task-item.done {
   opacity: 0.62;
+}
+
+.task-item.fixed {
+  border-left: 4px solid #2f6e9c;
+  background: #edf4fa;
+}
+
+.task-fixed-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: #2f6e9c;
+  color: #ffffff;
+  font-size: 10px;
+  font-weight: 800;
 }
 
 .time-block,
@@ -889,7 +984,28 @@ textarea {
 }
 
 .time-block {
-  grid-template-columns: 92px minmax(0, 1fr) 40px;
+  grid-template-columns: 92px minmax(0, 1fr) 40px 40px;
+}
+
+.time-block.editing {
+  grid-template-columns: 1fr;
+  padding: 14px;
+}
+
+.block-edit-form {
+  display: grid;
+  gap: 10px;
+}
+
+.block-edit-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr auto;
+  gap: 10px;
+  align-items: center;
+}
+
+.block-edit-row input[type="time"] {
+  min-width: 0;
 }
 
 .time-block.auto {
@@ -1290,15 +1406,20 @@ textarea {
     border-bottom: 0;
   }
 
-  .task-form,
+  .task-form {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .task-form > input:first-child {
+    grid-column: 1 / -1;
+  }
+
   .block-form,
   .goal-form,
   .breakdown-form {
     grid-template-columns: 1fr 1fr;
   }
 
-  .task-form input:first-child,
-  .task-form select:nth-of-type(2),
   .block-form select,
   .block-form input[name="title"],
   .goal-form input,
@@ -1322,7 +1443,6 @@ textarea {
 
   .settings-panel,
   .ai-panel,
-  .task-form,
   .block-form,
   .goal-form,
   .breakdown-form,
@@ -1330,8 +1450,6 @@ textarea {
     grid-template-columns: 1fr;
   }
 
-  .task-form input:first-child,
-  .task-form select:nth-of-type(2),
   .block-form select,
   .block-form input[name="title"],
   .goal-form input,
