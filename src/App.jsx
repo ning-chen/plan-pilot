@@ -1287,6 +1287,9 @@ function App() {
     };
   }, [planner.goals, planner.blocks, selectedDate]);
 
+  const showAiFollowUp =
+    !aiStatus.loading && Boolean(aiStatus.message) && aiTaskSuggestions.length === 0 && /[?？]|请.*回答|需要你先补充|缺少/.test(aiStatus.message);
+
   const viewHeadline =
     activeView === "today"
       ? formatHumanDate(selectedDate)
@@ -2492,6 +2495,10 @@ function App() {
             startPlanningCoach={startPlanningCoach}
             sendPlanningCoachMessage={sendPlanningCoachMessage}
             acceptPlanningCoachSuggestions={acceptPlanningCoachSuggestions}
+            showAiFollowUp={showAiFollowUp}
+            todayAiReply={todayAiReply}
+            setTodayAiReply={setTodayAiReply}
+            sendTodayAiReply={sendTodayAiReply}
           />
         )}
 
@@ -2582,6 +2589,10 @@ function TodayView({
   startPlanningCoach,
   sendPlanningCoachMessage,
   acceptPlanningCoachSuggestions,
+  showAiFollowUp,
+  todayAiReply,
+  setTodayAiReply,
+  sendTodayAiReply,
 }) {
   const overload = plannedMinutes > workMinutes;
   const [editingTaskId, setEditingTaskId] = useState(null);
