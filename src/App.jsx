@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlarmClock,
   CalendarDays,
@@ -12,6 +12,7 @@ import {
   Pencil,
   Plus,
   RefreshCw,
+  SkipForward,
   Send,
   Sparkles,
   Target,
@@ -176,12 +177,12 @@ const AI_PROVIDER_PRESETS = {
 
 const defaultState = {
   settings: {
-    workStart: "09:00",
-    workEnd: "18:00",
-    breakMinutes: 10,
+    workSegments: [{ start: "09:00", end: "12:00" }, { start: "14:00", end: "18:00" }],
+    shortBreak: 10,
+    longBreak: 30,
   },
   ai: {
-    enabled: false,
+    enabled: true,
     provider: "deepseek",
     protocol: "openai-compatible",
     baseUrl: "https://api.deepseek.com",
@@ -192,6 +193,7 @@ const defaultState = {
   blocks: [],
   dayPlans: {},
   reviews: [],
+  recurring: [],
 };
 
 function uid(prefix) {
@@ -210,6 +212,11 @@ function addDays(dateString, amount) {
   const date = new Date(year, month - 1, day);
   date.setDate(date.getDate() + amount);
   return getLocalDate(date);
+}
+
+function formatShortDate(dateString) {
+  const [year, month, day] = dateString.split("-").map(Number);
+  return `${month}月${day}日`;
 }
 
 function formatHumanDate(dateString) {
@@ -248,7 +255,15 @@ function hydrateState(input) {
   return {
     ...defaultState,
     ...input,
-    settings: { ...defaultState.settings, ...(input?.settings || {}) },
+    settings: {
+      ...defaultState.settings,
+      ...(input?.settings || {}),
+      // backward compat: convert old workStart/workEnd to workSegments
+      workSegments: input?.settings?.workSegments ||
+        (input?.settings?.workStart ? [{ start: input.settings.workStart, end: input.settings.workEnd || "18:00" }] : defaultState.settings.workSegments),
+      shortBreak: input?.settings?.shortBreak ?? input?.settings?.breakMinutes ?? defaultState.settings.shortBreak,
+      longBreak: input?.settings?.longBreak ?? defaultState.settings.longBreak,
+    },
     ai: { ...defaultState.ai, ...(input?.ai || {}) },
     goals: Array.isArray(input?.goals)
       ? input.goals.map((g) => ({ progress: 0, ...g }))
@@ -622,7 +637,7 @@ function filterCoachItems(items, planner) {
 function normalizeTitle(title) {
   return String(title || "")
     .toLowerCase()
-    .replace(/[\s，。！？、,.!?;；:："'“”‘’（）()[\]【】《》<>-]/g, "")
+    .replace(/[\s，。！？、,.!?;；:："'"''（）()[\]【】《》<>-]/g, "")
     .trim();
 }
 
@@ -731,7 +746,7 @@ function defaultBusyDuration(sentence) {
 
 function isBusySentence(sentence) {
   if (/购买|买票|订票|预订|查票|抢票/.test(sentence)) return false;
-  return /会议|开会|课题会|组会|例会|研讨会|讨论|探讨|汇报|会谈|监考|考试|上课|答辩|面试|出发|前往|返回|通勤|火车|高铁|航班/.test(sentence);
+  return /会议|开会|课题会|组会|例会|研讨会|讨论|探讨|汇报|会谈|监考|考试|上课|答辩|面试|出发|前往|返回|通勤|火车|高铁|航班|去|外出|办事|接人|送|医院|体检|银行|办理|聚餐|午饭|午休|休息|赴|参观|出差|请假/.test(sentence);
 }
 
 function isMeetingSentence(sentence) {
@@ -1005,41 +1020,112 @@ function sortBlocks(blocks) {
 }
 
 function getProtectedBreaks(settings) {
-  const workStart = toMinutes(settings.workStart);
-  const workEnd = toMinutes(settings.workEnd);
-  const lunchStart = toMinutes("12:00");
-  const lunchEnd = toMinutes("13:00");
-  if (lunchEnd <= workStart || lunchStart >= workEnd) return [];
-  return [{ start: "12:00", end: "13:00", title: "午休" }];
+  // find midday gaps >30min between work segments
+  const segs = settings.workSegments || [];
+  const breaks = [];
+  for (let i = 0; i < segs.length - 1; i++) {
+    const gapStart = segs[i].end;
+    const gapEnd = segs[i + 1].start;
+    if (toMinutes(gapEnd) - toMinutes(gapStart) >= 30) {
+      breaks.push({ start: gapStart, end: gapEnd, title: "休息" });
+    }
+  }
+  return breaks;
+}
+
+function polishAiBlocks(blocks, segments, today) {
+  if (!blocks.length || !segments.length) return blocks;
+  const MIN_KEEP = 10;
+
+  // detect split pairs: blocks sharing same taskId or title with -A/-B/-I/-II suffix
+  const getBase = (title) => (title || "").replace(/[-_][ABIII]+$/, "").trim();
+  const result = blocks.map((b) => ({ ...b }));
+
+  for (let i = 0; i < result.length - 1; i++) {
+    const a = result[i];
+    const b = result[i + 1];
+    if (a._drop || b._drop) continue;
+    const sameTask = a.taskId && a.taskId === b.taskId;
+    const sameBase = getBase(a.title) === getBase(b.title) && a.title !== b.title;
+    if (!sameTask && !sameBase) continue;
+
+    const aDur = toMinutes(a.end) - toMinutes(a.start);
+    const bDur = toMinutes(b.end) - toMinutes(b.start);
+
+    if (aDur < MIN_KEEP) {
+      a._drop = true;
+      b.start = a.start;
+    }
+    if (bDur < MIN_KEEP) {
+      b._drop = true;
+      if (!a._drop) a.end = b.end;
+    }
+  }
+
+  // last segment tail: check if block near end of last segment
+  const lastSeg = segments[segments.length - 1];
+  const lastSegEnd = toMinutes(lastSeg.end);
+  for (let i = result.length - 1; i >= 0; i--) {
+    const b = result[i];
+    if (b._drop) continue;
+    const bEnd = toMinutes(b.end);
+    const bDur = bEnd - toMinutes(b.start);
+    if (bEnd <= lastSegEnd) {
+      const remaining = lastSegEnd - bEnd;
+      if (remaining > 0 && remaining < bDur) {
+        // task ended, but the remaining gap after it is too small for the same task
+        // → leave as-is, AI already handled
+      }
+    }
+    break; // only check last block
+  }
+
+  return result;
+}
+
+function workloadMinutes(settings) {
+  return (settings.workSegments || []).reduce((sum, seg) => sum + duration(seg.start, seg.end), 0);
 }
 
 function getFreeIntervals(settings, fixedBlocks, options = {}) {
-  const start = toMinutes(settings.workStart);
-  const end = toMinutes(settings.workEnd);
-  const protectedBreaks = options.protectLunch === false ? [] : getProtectedBreaks(settings);
-  const fixed = sortBlocks(fixedBlocks.concat(protectedBreaks)).map((block) => ({
+  const segments = settings.workSegments || [];
+  if (!segments.length) return [];
+  const fixed = sortBlocks(fixedBlocks).map((block) => ({
     start: toMinutes(block.start),
     end: toMinutes(block.end),
   }));
   const intervals = [];
-  let cursor = start;
 
-  fixed.forEach((block) => {
-    if (block.start > cursor) {
-      intervals.push({ start: cursor, end: Math.min(block.start, end) });
+  segments.forEach((seg) => {
+    const segStart = toMinutes(seg.start);
+    const segEnd = toMinutes(seg.end);
+    let cursor = segStart;
+
+    fixed.forEach((block) => {
+      if (block.start > cursor && block.start < segEnd) {
+        intervals.push({ start: cursor, end: Math.min(block.start, segEnd), segment: seg });
+      }
+      cursor = Math.max(cursor, Math.min(block.end, segEnd));
+    });
+
+    if (cursor < segEnd) {
+      intervals.push({ start: cursor, end: segEnd, segment: seg });
     }
-    cursor = Math.max(cursor, block.end);
   });
-
-  if (cursor < end) {
-    intervals.push({ start: cursor, end });
-  }
 
   return intervals.filter((interval) => interval.end > interval.start);
 }
 
+function overlapsAny(block, blocks) {
+  if (!Array.isArray(blocks)) return false;
+  const start = toMinutes(block.start);
+  const end = toMinutes(block.end);
+  return blocks.some((item) => start < toMinutes(item.end) && end > toMinutes(item.start));
+}
+
 function isInsideWorkWindow(block, settings) {
-  return toMinutes(block.start) >= toMinutes(settings.workStart) && toMinutes(block.end) <= toMinutes(settings.workEnd);
+  const segs = settings.workSegments || [];
+  return segs.some((seg) => toMinutes(block.start) >= toMinutes(seg.start) && toMinutes(block.end) <= toMinutes(seg.end));
 }
 
 function preparePlannerForScheduling({ tasks, blocks, settings, selectedDate }) {
@@ -1092,7 +1178,7 @@ function buildAutoBlocks({ tasks, existingBlocks, settings, selectedDate }) {
           ? "请告诉我你准备什么时候买票，或最晚几点前必须买好，再手动放入时间块。"
           : "请先添加会议的不可用时间块，或手动指定这个任务的开始时间。",
         needsPlacement: (postMeeting && !meetingEnd) || ambiguousTicketPurchase,
-        earliestStart: postMeeting && meetingEnd ? meetingEnd : toMinutes(settings.workStart),
+        earliestStart: postMeeting && meetingEnd ? meetingEnd : toMinutes((settings.workSegments || [{ start: "09:00" }])[0].start),
       };
     });
 
@@ -1126,6 +1212,7 @@ function buildAutoBlocks({ tasks, existingBlocks, settings, selectedDate }) {
       const estimate = Number(task.estimateMinutes) || 30;
       const start = Math.max(cursor, task.earliestStart || interval.start);
       const end = start + estimate;
+      const tasksBefore = autoBlocks.filter((b) => b.type === "task").length;
 
       autoBlocks.push({
         id: uid("block"),
@@ -1136,7 +1223,7 @@ function buildAutoBlocks({ tasks, existingBlocks, settings, selectedDate }) {
         end: toTime(end),
         auto: true,
       });
-      cursor = end + Number(settings.breakMinutes || 0);
+      cursor = end + Number(tasksBefore % 2 === 0 ? (settings.shortBreak || 10) : (settings.longBreak || 30));
     }
   });
 
@@ -1208,6 +1295,18 @@ function App() {
     adjustments: "",
     tomorrowFocus: "",
   });
+  const [recurringDraft, setRecurringDraft] = useState({
+    title: "",
+    start: "09:00",
+    end: "10:00",
+    dayOfWeek: 1,
+    endDate: "",
+  });
+  const [showRecurringModal, setShowRecurringModal] = useState(false);
+  const [editingRecurringId, setEditingRecurringId] = useState(null);
+  const [showSegmentModal, setShowSegmentModal] = useState(false);
+  const [segmentDraft, setSegmentDraft] = useState({ start: "09:00", end: "12:00" });
+  const dayNames = ["日", "一", "二", "三", "四", "五", "六"];
 
   useEffect(() => {
     setPlanner((current) => {
@@ -1261,7 +1360,7 @@ function App() {
   const activeGoals = planner.goals.filter((goal) => goal.status !== "done");
   const plannedMinutes = sum(todayTasks.filter((task) => task.status !== "done").map((task) => Number(task.estimateMinutes) || 0));
   const scheduledMinutes = sum(todayBlocks.map((block) => duration(block.start, block.end)));
-  const workMinutes = duration(planner.settings.workStart, planner.settings.workEnd);
+  const workMinutes = workloadMinutes(planner.settings);
   const busyMinutes = sum(
     todayBlocks
       .filter((block) => block.type === "busy" || (!block.taskId && !block.auto))
@@ -1294,8 +1393,8 @@ function App() {
     activeView === "today"
       ? formatHumanDate(selectedDate)
       : activeView === "goals"
-        ? "先选一个目标，把它拆成更小的下一步。"
-        : "收束今天的结果，并决定明天先做什么。";
+        ? "先选个目标，拆成更小的下一步。"
+        : "今天做得如何？明天要做什么？";
   const currentAiPreset = AI_PROVIDER_PRESETS[planner.ai.provider] || AI_PROVIDER_PRESETS.custom;
 
   function patchPlanner(updater) {
@@ -1330,6 +1429,18 @@ function App() {
           ...patch,
         },
       },
+    }));
+  }
+
+  function addRecurring(item) {
+    patchPlanner((current) => ({
+      recurring: (current.recurring || []).concat(item),
+    }));
+  }
+
+  function deleteRecurring(recId) {
+    patchPlanner((current) => ({
+      recurring: (current.recurring || []).filter((r) => r.id !== recId),
     }));
   }
 
@@ -1440,8 +1551,12 @@ function App() {
 
   function deferTask(taskId) {
     const tomorrow = addDays(selectedDate, 1);
+    deferTaskTo(taskId, tomorrow);
+  }
+
+  function deferTaskTo(taskId, targetDate) {
     patchPlanner((current) => ({
-      tasks: current.tasks.map((task) => (task.id === taskId ? { ...task, date: tomorrow, status: "open" } : task)),
+      tasks: current.tasks.map((task) => (task.id === taskId ? { ...task, date: targetDate, status: "open" } : task)),
       blocks: current.blocks.filter((block) => !(block.taskId === taskId && block.date === selectedDate)),
     }));
   }
@@ -1479,13 +1594,13 @@ function App() {
         messages: [
           {
             role: "system",
-            content: `你是时间规划助手。根据用户画像、工作时间、固定安排和待办任务，生成最优时间分配。只返回 JSON：{"blocks":[{"taskId":"...","start":"HH:MM","end":"HH:MM"}],"message":"简短说明"}。规则：不覆盖固定不可用时间，高优先级任务优先，相似任务连续，留出缓冲，每项任务之间留${planner.settings.breakMinutes}分钟间隔。`,
+            content: `你是 Plan Pilot 的时间安排助手。根据用户画像、工作段、固定安排和待办，生成最优时间分配。仅返回 JSON：{"blocks":[{"taskId":"...","start":"HH:MM","end":"HH:MM"}],"message":"简短说明"}。规则：不覆盖 busyBlocks；每2个任务后长休息${planner.settings.longBreak || 30}min，其余短休息${planner.settings.shortBreak || 10}min；今日有剩余可安排 futureTasks；跨段拆分为"任务-I"/"任务-II"。`,
           },
           {
             role: "user",
             content: JSON.stringify({
               date: selectedDate,
-              workHours: { start: planner.settings.workStart, end: planner.settings.workEnd },
+              workSegments: planner.settings.workSegments,
               breakMinutes: planner.settings.breakMinutes,
               profile,
               tasks: todayTasks.map((t) => ({
@@ -1499,25 +1614,47 @@ function App() {
                 start: b.start,
                 end: b.end,
               })),
+              futureTasks: planner.tasks
+                .filter((t) => t.date > selectedDate && t.status !== "done")
+                .sort((a, b) => priorityOrder[b.priority] - priorityOrder[a.priority])
+                .slice(0, 3)
+                .map((t) => ({
+                  id: t.id,
+                  title: t.title,
+                  estimateMinutes: t.estimateMinutes,
+                  priority: t.priority,
+                  date: t.date,
+                })),
             }),
           },
         ],
       });
 
-      const aiBlocks = (result.blocks || []).map((b) => ({
-        id: uid("block"),
+      const polished = polishAiBlocks(result.blocks || [], planner.settings.workSegments || [], selectedDate);
+      const aiBlocks = polished.filter(b => !b._drop).map((b) => ({
+        id: b._isDeferred ? uid("task") : uid("block"),
         taskId: b.taskId || "",
-        type: "task",
-        date: selectedDate,
-        start: b.start,
-        end: b.end,
-        auto: true,
+        ...(b._isDeferred ? {} : { type: "task", date: selectedDate, start: b.start, end: b.end, auto: true }),
       }));
 
+      // handle deferred tasks
+      const deferredBlocks = polished.filter(b => b._isDeferred);
+      if (deferredBlocks.length > 0) {
+        const tomorrow = addDays(selectedDate, 1);
+        deferredBlocks.forEach((b) => {
+          patchPlanner((current) => ({
+            tasks: current.tasks.map((t) =>
+              t.id === b.taskId ? { ...t, date: tomorrow } : t
+            ),
+          }));
+        });
+      }
+
+      const realBlocks = aiBlocks.filter(b => b.type === "task");
       const manualBlocks = planner.blocks.filter(
         (b) => !(b.date === selectedDate && b.auto),
       );
-      patchPlanner({ blocks: manualBlocks.concat(aiBlocks) });
+      patchPlanner({ blocks: manualBlocks.concat(realBlocks) });
       setScheduleQuestions([]);
       setAiStatus({ loading: false, error: "", message: result.message || "AI 已完成时间安排。" });
     } catch (error) {
@@ -1695,7 +1832,7 @@ function App() {
     if (!goal) return;
     setBreakdownDraft((draft) => ({ ...draft, goalId: goal.id }));
 
-    if (!planner.ai.enabled || !planner.ai.apiKey.trim()) {
+    if (!planner.ai.enabled) {
       setBreakdownSuggestions(filterBreakdownItems(makeBreakdown(goal, breakdownDraft, selectedDate), planner, goal));
       setAiStatus({ loading: false, error: "", message: "已使用规则拆解。启用 AI 并填写 Key 后，可改用大模型拆解。" });
       return;
@@ -1710,22 +1847,7 @@ function App() {
           {
             role: "system",
             content:
-              "你是一个主动规划助手。请把用户的目标拆成可执行的下一层计划，只返回 JSON。JSON 格式：{\"summary\":\"一句话说明\",\"items\":[{\"kind\":\"goal\",\"type\":\"month|week\",\"title\":\"...\",\"priority\":\"high|medium|low\"},{\"kind\":\"task\",\"date\":\"YYYY-MM-DD\",\"title\":\"...\",\"estimateMinutes\":60,\"priority\":\"high|medium|low\"}]}。长期目标拆成月度目标，月度目标拆成本周目标，本周目标拆成具体任务。不要返回 markdown。",
-          },
-          {
-            role: "system",
-            content:
-              "Important constraints: existingTasks are context only. Do not copy, relabel, or attach any existing task to the selected goal. Only output new items that directly serve the selected goal. If a task title already exists for the same date, omit it. Fixed-time commitments should constrain scheduling; do not convert them into unrelated goal tasks.",
-          },
-          {
-            role: "system",
-            content:
-              "Be proactive and coach-like. If the goal, deliverable, deadline, dependencies, or definition of done is unclear, do not fabricate a breakdown. Return JSON with items: [] and a concise summary that asks 1-3 targeted follow-up questions in Chinese. If enough information is available, output the smallest useful next layer of work and include one short coaching summary.",
-          },
-          {
-            role: "system",
-            content:
-              "Use realistic duration estimates. Complex research design tasks such as 初步设计, 框架设计, 方案设计, 技术路线, 多智能体方法设计, paper/proposal planning, or system architecture should be at least 180 minutes unless the user says it is only a short note.",
+              "你是 Plan Pilot 的规划助手。把用户目标拆为下一层计划，仅返回 JSON：{\"summary\":\"一句话\",\"items\":[{\"kind\":\"goal\",\"type\":\"month|week\",\"title\":\"...\",\"priority\":\"high|medium|low\"},{\"kind\":\"task\",\"date\":\"YYYY-MM-DD\",\"title\":\"...\",\"estimateMinutes\":60,\"priority\":\"high|medium|low\"}]}。约束：现有任务是上下文不要复制；目标不清时返回 items:[] 并用 summary 提 1-3 个追问；复杂设计任务(方案/框架/技术路线)估时≥180分钟。",
           },
           {
             role: "user",
@@ -1736,14 +1858,6 @@ function App() {
               deadline: breakdownDraft.deadline,
               constraints: breakdownDraft.constraints,
               existingGoals: planner.goals.map(({ id, title, type, parentId, status }) => ({ id, title, type, parentId, status })),
-              existingTasks: planner.tasks.slice(-20).map(({ title, date, priority, status, estimateMinutes }) => ({
-                title,
-                date,
-                priority,
-                status,
-                estimateMinutes,
-              })),
-              doNotRepeatTaskTitles: planner.tasks.map((task) => task.title),
             }),
           },
         ],
@@ -1813,8 +1927,8 @@ function App() {
   async function generateTodayAiGuide(extraAnswer = "") {
     const followUpAnswer = typeof extraAnswer === "string" ? extraAnswer.trim() : "";
 
-    if (!planner.ai.enabled || !planner.ai.apiKey.trim()) {
-      setAiStatus({ loading: false, error: "请先在左侧启用 AI 并填写当前服务商的 API Key。", message: "" });
+    if (!planner.ai.enabled) {
+      setAiStatus({ loading: false, error: "请先在左侧启用 AI。", message: "" });
       return;
     }
 
@@ -1828,27 +1942,7 @@ function App() {
           {
             role: "system",
             content:
-              "你是一个主动规划助手。请基于今天的精力、固定安排、目标、已有任务和不可用时间，给出今日建议任务。只返回 JSON：{\"message\":\"一句提醒\",\"tasks\":[{\"title\":\"...\",\"estimateMinutes\":45,\"priority\":\"high|medium|low\",\"goalId\":\"可选目标id\",\"reason\":\"为什么建议\"}]}。任务要具体、可执行、不要过量。",
-          },
-          {
-            role: "system",
-            content:
-              "Important constraints: todayTasks already exist. Do not suggest duplicate task titles. If a fixed-time commitment appears in dayPlan or timeBlocks, protect that time and do not turn it into a normal goal task. Suggested tasks must be new, specific, and realistic for the remaining available time.",
-          },
-          {
-            role: "system",
-            content:
-              "Be more proactive than a passive checklist. First identify missing constraints, risky sequencing, unclear deliverables, and time conflicts. If the plan is under-specified, return JSON with tasks: [] and a message that asks 1-3 concrete questions in Chinese. If the plan is clear, suggest only the few tasks that materially improve today's execution, with reasons and realistic durations.",
-          },
-          {
-            role: "system",
-            content:
-              "When a task is about buying or booking tickets, distinguish the travel/departure time from the execution time. Ask '你打算什么时候买票/最晚几点前买好？' instead of only asking '买什么时候的票'. Respect task dependencies: print before scan/upload/submit, scan before upload, outline/framework/core points before drafting. If dependency order is unclear, ask a follow-up question rather than generating a contradictory schedule.",
-          },
-          {
-            role: "system",
-            content:
-              "Estimate time conservatively. For tasks involving 初步设计, 框架设计, 方案设计, 技术路线, 多智能体方法设计, 论文/项目方案, or research proposal writing, use at least 180 minutes unless the user explicitly says it is a quick note. Do not compress complex design work into 60 or 90 minutes.",
+              "你是 Plan Pilot 的今日建议助手。基于用户精力、固定安排、目标和已有任务，给出具体可执行的新任务，仅返回 JSON：{\"message\":\"提醒或追问\",\"tasks\":[{\"title\":\"...\",\"estimateMinutes\":45,\"priority\":\"high|medium|low\",\"goalId\":\"可选\",\"reason\":\"为什么\"}]}。约束：不重复已有任务；保护固定时间块；计划不清时 tasks:[] 并用 message 提 1-3 个追问（中文）；复杂设计任务≥180分钟；区分购票执行时间与出行时间，注意打印→扫描→上传等依赖顺序。",
           },
           {
             role: "user",
@@ -1857,15 +1951,8 @@ function App() {
               dayPlan,
               settings: planner.settings,
               activeGoals: activeGoals.map(({ id, title, type, priority, status }) => ({ id, title, type, priority, status })),
-              todayTasks: todayTasks.map(({ title, estimateMinutes, priority, status, goalId }) => ({
-                title,
-                estimateMinutes,
-                priority,
-                status,
-                goalId,
-              })),
+              todayTasks: todayTasks.map(({ title, estimateMinutes, priority, status, goalId }) => ({ title, estimateMinutes, priority, status, goalId })),
               timeBlocks: todayBlocks.map(({ title, taskId, type, start, end, auto }) => ({ title, taskId, type, start, end, auto })),
-              doNotRepeatTaskTitles: todayTasks.map((task) => task.title),
               previousAiQuestion: followUpAnswer ? aiStatus.message : "",
               followUpAnswer,
             }),
@@ -1926,11 +2013,11 @@ function App() {
   }
 
   async function runPlanningCoach(nextMessages) {
-    if (!planner.ai.enabled || !planner.ai.apiKey.trim()) {
+    if (!planner.ai.enabled) {
       setPlanningCoach((coach) => ({
         ...coach,
         loading: false,
-        error: "请先在左侧启用 AI 并填写当前服务商的 API Key。",
+        error: "请先在左侧启用 AI。",
       }));
       return;
     }
@@ -1946,23 +2033,17 @@ function App() {
           {
             role: "system",
             content:
-              "You are an active planning coach. Interview the user to add and break down today, this week, monthly, or long-term work. If you need more information, ask one concise question in natural Chinese. When you have enough information, prefer JSON: {\"message\":\"summary\",\"done\":false,\"items\":[{\"kind\":\"goal\",\"tempId\":\"g1\",\"type\":\"long|month|week\",\"title\":\"...\",\"priority\":\"high|medium|low\",\"parentId\":\"existing id or tempId\",\"parentTitle\":\"optional\"},{\"kind\":\"task\",\"date\":\"YYYY-MM-DD\",\"title\":\"...\",\"estimateMinutes\":60,\"priority\":\"high|medium|low\",\"goalId\":\"existing id or tempId\",\"goalTitle\":\"optional\"},{\"kind\":\"busy\",\"date\":\"YYYY-MM-DD\",\"title\":\"...\",\"start\":\"HH:MM\",\"end\":\"HH:MM\"}]}. Use absolute dates for future tasks. If an item is not tied to a specific date, make it a week/month/long goal rather than a task. Do not duplicate existing tasks or goals. Estimate durations realistically: research framework design, project design, technical route, multi-agent method design, or thesis/proposal writing usually needs at least 180 minutes unless the user says it is tiny.",
+              "你是 Plan Pilot 的规划访谈助手。通过提问帮用户梳理今天/本周/月度/长期工作。信息不足时中文提 1 个简洁问题；信息足够时输出 JSON：{\"message\":\"...\",\"done\":false,\"items\":[{\"kind\":\"goal\",\"tempId\":\"g1\",\"type\":\"long|month|week\",\"title\":\"...\",\"priority\":\"high|medium|low\",\"parentId\":\"existing id or tempId\"},{\"kind\":\"task\",\"date\":\"YYYY-MM-DD\",\"title\":\"...\",\"estimateMinutes\":60,\"priority\":\"high|medium|low\",\"goalId\":\"existing id or tempId\"},{\"kind\":\"busy\",\"date\":\"YYYY-MM-DD\",\"title\":\"...\",\"start\":\"HH:MM\",\"end\":\"HH:MM\"}]}。未来任务用绝对日期；无日期定锚的设为周/月/长期目标。不重复已有目标/任务；复杂设计任务估时≥180分钟。",
           },
           {
             role: "system",
             content:
-              "Conversation policy: after each user answer, decide whether one more key question is needed or whether actionable items can be proposed. Do not repeat the user's own text as a new task unless it is truly new. When proposing items, include dependencies and fixed-time commitments as busy blocks, and make meeting preparation happen before the meeting and meeting summary/follow-up after the meeting.",
+              "对话策略：每次回答后判断是否还需追问；不重复用户原文；会议前后分别安排准备和总结任务；用 busy 块标注固定时间占用。",
             },
             {
               role: "system",
-              content:
-                "For long-scope interviews, propose a small hierarchy instead of a flat task dump: one long goal if missing, one or two month/week goals, and only the next dated tasks. Keep proposals compact, usually 4-8 items. Existing tasks and goals are context only; if something already exists, reference it by id/title but do not output it again.",
+              content: "长周期访谈构建小层级结构而非扁平任务列表：1 个长期目标 + 1-2 个月度/周目标 + 下步任务，共 4-8 项。已有目标/任务仅作上下文引用不重复。购票任务区分执行时间与出行时间，注意打印→扫描→上传等依赖顺序。",
             },
-            {
-              role: "system",
-              content:
-              "For ticket-buying tasks, ask when the user will execute the purchase or the latest acceptable purchase time; do not confuse that with the train/flight departure time. Preserve dependencies such as print before scan/upload/submit and outline/framework before drafting.",
-          },
           {
             role: "user",
             content: JSON.stringify({
@@ -2153,11 +2234,16 @@ function App() {
   }
 
   function resetLocalData() {
-    if (!window.confirm("确定清空当前浏览器中的目标、任务、时间块、复盘记录和本地 API Key 吗？此操作无法撤销。")) return;
+    const CONFIRM_TEXT = "我确认清空本地数据";
+    const input = window.prompt(`此操作将清空所有目标、任务、时间块和复盘记录，且无法撤销。\n\n请输入"${CONFIRM_TEXT}"以继续：`);
+    if (input !== CONFIRM_TEXT) {
+      if (input !== null) window.alert("输入不匹配，操作已取消。");
+      return;
+    }
     setPlanner(hydrateState(defaultState));
     setSelectedDate(getLocalDate());
     setTaskDraft({ title: "", estimateMinutes: 60, priority: "medium", goalId: "" });
-    setBlockDraft({ type: "task", taskId: "", title: "", start: defaultState.settings.workStart, end: "10:00" });
+    setBlockDraft({ type: "task", taskId: "", title: "", start: (defaultState.settings.workSegments[0]?.start || "09:00"), end: "10:00" });
     setBreakdownDraft({ goalId: "", outcome: "", deadline: "", constraints: "" });
     setBreakdownSuggestions([]);
     setAiStatus({ loading: false, error: "", message: "本地数据已清空。" });
@@ -2237,7 +2323,7 @@ function App() {
         messages: [
           {
             role: "system",
-            content: "你是用户画像分析师。根据复盘内容更新用户工作风格、精力模式、偏好和典型日程的简短描述。只返回 JSON：{\"workStyle\":\"...\",\"energyPattern\":\"...\",\"preferences\":\"...\",\"typicalDay\":\"...\",\"notes\":\"...\"}。保持字段简洁，每条1-2句话。保留已有画像中有价值的信息，增量更新。",
+            content: "你是 Plan Pilot 的画像分析师。根据复盘更新用户画像，仅返回 JSON：{\"workStyle\":\"...\",\"energyPattern\":\"...\",\"preferences\":\"...\",\"typicalDay\":\"...\",\"notes\":\"...\"}。每条 1-2 句话，增量更新保留已有有价值信息。",
           },
           {
             role: "user",
@@ -2304,45 +2390,187 @@ function App() {
         </nav>
 
         <section className="settings-panel">
+          <div className="work-segments-label">工作时段</div>
+          {(planner.settings.workSegments || []).map((seg, i) => (
+            <div className="work-segment-item" key={i}>
+              <span>{seg.start} - {seg.end}</span>
+              <button className="icon-button" onClick={() => {
+                patchPlanner((current) => ({
+                  settings: {
+                    ...current.settings,
+                    workSegments: current.settings.workSegments.filter((_, idx) => idx !== i),
+                  },
+                }));
+              }}>
+                <Trash2 size={14} />
+              </button>
+            </div>
+          ))}
+          {(planner.settings.workSegments || []).length < 3 && (
+            <button className="compact-action" onClick={() => {
+              const totalMin = workloadMinutes(planner.settings);
+              setSegmentDraft({ start: "09:00", end: "12:00" });
+              setShowSegmentModal(true);
+            }}>
+              <Plus size={14} />
+              添加时段
+            </button>
+          )}
+
+          {showSegmentModal && (
+            <div className="modal-overlay" onClick={() => setShowSegmentModal(false)}>
+              <div className="modal-content" onClick={(e) => e.stopPropagation()}>
+                <h3>添加工作时段</h3>
+                <div className="modal-row">
+                  <label>开始 <input type="time" lang="zh-CN" value={segmentDraft.start}
+                    onChange={(e) => setSegmentDraft((d) => ({ ...d, start: e.target.value }))} /></label>
+                  <label>结束 <input type="time" lang="zh-CN" value={segmentDraft.end}
+                    onChange={(e) => setSegmentDraft((d) => ({ ...d, end: e.target.value }))} /></label>
+                </div>
+                <div className="modal-actions">
+                  <button className="secondary-action" onClick={() => setShowSegmentModal(false)}>取消</button>
+                  <button className="primary-action" onClick={() => {
+                    const newDur = toMinutes(segmentDraft.end) - toMinutes(segmentDraft.start);
+                    if (newDur <= 0) return;
+                    const currentTotal = workloadMinutes(planner.settings);
+                    if (currentTotal + newDur > 600) { window.alert("总工作时长不能超过 10 小时。"); return; }
+                    patchPlanner((current) => ({
+                      settings: {
+                        ...current.settings,
+                        workSegments: [...(current.settings.workSegments || []), { start: segmentDraft.start, end: segmentDraft.end }]
+                          .sort((a, b) => toMinutes(a.start) - toMinutes(b.start)),
+                      },
+                    }));
+                    setShowSegmentModal(false);
+                  }}>确认添加</button>
+                </div>
+              </div>
+            </div>
+          )}
           <label>
-            工作开始
+            短休息 (分钟)
             <input
-              type="time"
-              value={planner.settings.workStart}
+              type="number"
+              min="0"
+              max="30"
+              value={planner.settings.shortBreak}
               onChange={(event) =>
                 patchPlanner((current) => ({
-                  settings: { ...current.settings, workStart: event.target.value },
+                  settings: { ...current.settings, shortBreak: Number(event.target.value) },
                 }))
               }
             />
           </label>
           <label>
-            工作结束
-            <input
-              type="time"
-              value={planner.settings.workEnd}
-              onChange={(event) =>
-                patchPlanner((current) => ({
-                  settings: { ...current.settings, workEnd: event.target.value },
-                }))
-              }
-            />
-          </label>
-          <label>
-            间隔分钟
+            长休息 (分钟)
             <input
               type="number"
               min="0"
               max="60"
-              value={planner.settings.breakMinutes}
+              value={planner.settings.longBreak}
               onChange={(event) =>
                 patchPlanner((current) => ({
-                  settings: { ...current.settings, breakMinutes: Number(event.target.value) },
+                  settings: { ...current.settings, longBreak: Number(event.target.value) },
                 }))
               }
             />
           </label>
         </section>
+
+        <section className="recurring-panel">
+          <p className="recurring-label">周期安排</p>
+          {(planner.recurring || []).map((r) => (
+            <div className="recurring-item" key={r.id}>
+              <span>
+                {r.title} · 周{dayNames[r.dayOfWeek]} {r.start}-{r.end}
+                {r.endDate ? ` 至 ${r.endDate}` : ""}
+              </span>
+              <button className="icon-button" onClick={() => {
+                setEditingRecurringId(r.id);
+                setRecurringDraft({ title: r.title, start: r.start, end: r.end, dayOfWeek: r.dayOfWeek, endDate: r.endDate || "" });
+                setShowRecurringModal(true);
+              }}>
+                <Pencil size={14} />
+              </button>
+            </div>
+          ))}
+          <div className="recurring-add-row">
+            <input
+              value={recurringDraft.title}
+              onChange={(e) => setRecurringDraft((d) => ({ ...d, title: e.target.value }))}
+              placeholder="例如：组会"
+            />
+            <button className="compact-action solid" onClick={() => {
+              setEditingRecurringId(null);
+              setRecurringDraft({ title: "", start: "09:00", end: "10:00", dayOfWeek: 1, endDate: "" });
+              setShowRecurringModal(true);
+            }}>
+              <Plus size={16} />
+            </button>
+          </div>
+        </section>
+
+        {showRecurringModal && (
+          <div className="modal-overlay" onClick={() => setShowRecurringModal(false)}>
+            <div className="modal-content" onClick={(e) => e.stopPropagation()}>
+              <h3>{editingRecurringId ? "编辑周期安排" : "添加周期安排"}</h3>
+              <label>
+                名称
+                <input
+                  value={recurringDraft.title}
+                  onChange={(e) => setRecurringDraft((d) => ({ ...d, title: e.target.value }))}
+                  placeholder="例如：组会"
+                />
+              </label>
+              <div className="modal-row">
+                <label>
+                  开始
+                  <input type="time" lang="zh-CN" value={recurringDraft.start}
+                    onChange={(e) => setRecurringDraft((d) => ({ ...d, start: e.target.value }))} />
+                </label>
+                <label>
+                  结束
+                  <input type="time" lang="zh-CN" value={recurringDraft.end}
+                    onChange={(e) => setRecurringDraft((d) => ({ ...d, end: e.target.value }))} />
+                </label>
+              </div>
+              <label>
+                星期
+                <select value={recurringDraft.dayOfWeek}
+                  onChange={(e) => setRecurringDraft((d) => ({ ...d, dayOfWeek: Number(e.target.value) }))}>
+                  {dayNames.map((name, i) => (
+                    <option key={i} value={i}>周{name}</option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                结束日期（可选）
+                <input type="date" value={recurringDraft.endDate}
+                  onChange={(e) => setRecurringDraft((d) => ({ ...d, endDate: e.target.value }))} />
+              </label>
+              <div className="modal-actions">
+                {editingRecurringId && (
+                  <button className="secondary-action" style={{ marginRight: "auto", color: "#b83b2c", borderColor: "#b83b2c" }} onClick={() => {
+                    deleteRecurring(editingRecurringId);
+                    setShowRecurringModal(false);
+                    setEditingRecurringId(null);
+                  }}>删除</button>
+                )}
+                <button className="secondary-action" onClick={() => { setShowRecurringModal(false); setEditingRecurringId(null); }}>取消</button>
+                <button className="primary-action" onClick={() => {
+                  if (!recurringDraft.title.trim()) return;
+                  if (editingRecurringId) {
+                    deleteRecurring(editingRecurringId);
+                  }
+                  addRecurring({ id: editingRecurringId || uid("rec"), ...recurringDraft });
+                  setRecurringDraft({ title: "", start: "09:00", end: "10:00", dayOfWeek: 1, endDate: "" });
+                  setShowRecurringModal(false);
+                  setEditingRecurringId(null);
+                }}>{editingRecurringId ? "保存修改" : "确认添加"}</button>
+              </div>
+            </div>
+          </div>
+        )}
 
         <section className="ai-panel">
           <label className="ai-toggle">
@@ -2419,26 +2647,29 @@ function App() {
             <h1>{viewHeadline}</h1>
             {activeView === "today" && (
               <div className="topbar-highlights">
+                {upcomingHighlights.busy && (
+                  <span className="topbar-highlight busy" title={upcomingHighlights.busy.title}>
+                    <Clock3 size={12} />
+                    {upcomingHighlights.busy.title.length > 12
+                      ? upcomingHighlights.busy.title.slice(0, 12) + "..."
+                      : upcomingHighlights.busy.title}
+                    {" "}{formatShortDate(upcomingHighlights.busy.date)}
+                  </span>
+                )}
                 {upcomingHighlights.week && (
                   <span className="topbar-highlight week" title={upcomingHighlights.week.title}>
                     <Target size={12} />
-                    {upcomingHighlights.week.title.length > 10
-                      ? upcomingHighlights.week.title.slice(0, 10) + "..."
+                    {upcomingHighlights.week.title.length > 18
+                      ? upcomingHighlights.week.title.slice(0, 18) + "..."
                       : upcomingHighlights.week.title}
                   </span>
                 )}
                 {upcomingHighlights.month && (
                   <span className="topbar-highlight month" title={upcomingHighlights.month.title}>
                     <Target size={12} />
-                    {upcomingHighlights.month.title.length > 10
-                      ? upcomingHighlights.month.title.slice(0, 10) + "..."
+                    {upcomingHighlights.month.title.length > 18
+                      ? upcomingHighlights.month.title.slice(0, 18) + "..."
                       : upcomingHighlights.month.title}
-                  </span>
-                )}
-                {upcomingHighlights.busy && (
-                  <span className="topbar-highlight busy" title={upcomingHighlights.busy.title}>
-                    <Clock3 size={12} />
-                    {upcomingHighlights.busy.date} {upcomingHighlights.busy.start}
                   </span>
                 )}
               </div>
@@ -2479,11 +2710,30 @@ function App() {
             submitTaskForm={submitTaskForm}
             updateTask={updateTask}
             deferTask={deferTask}
+            deferTaskTo={deferTaskTo}
             deleteTask={deleteTask}
             autoSchedule={autoSchedule}
             scheduleQuestions={scheduleQuestions}
+            setScheduleQuestions={setScheduleQuestions}
             addManualBlock={addManualBlock}
             submitBlockForm={submitBlockForm}
+            addBlockDirectly={(data) => {
+              patchPlanner((current) => ({
+                blocks: current.blocks.concat({
+                  id: uid("block"),
+                  taskId: data.type === "busy" ? "" : data.taskId,
+                  title: data.title || (data.type === "busy" ? "固定占用" : ""),
+                  type: data.type,
+                  date: selectedDate,
+                  start: data.start,
+                  end: data.end,
+                  auto: false,
+                }),
+              }));
+              if (data.taskId) {
+                setScheduleQuestions((qs) => qs.filter((q) => q.taskId !== data.taskId));
+              }
+            }}
             deleteBlock={deleteBlock}
             updateBlock={updateBlock}
             aiStatus={aiStatus}
@@ -2573,11 +2823,14 @@ function TodayView({
   submitTaskForm,
   updateTask,
   deferTask,
+  deferTaskTo,
   deleteTask,
   autoSchedule,
   scheduleQuestions,
+  setScheduleQuestions,
   addManualBlock,
   submitBlockForm,
+  addBlockDirectly,
   deleteBlock,
   updateBlock,
   aiStatus,
@@ -2595,9 +2848,18 @@ function TodayView({
   sendTodayAiReply,
 }) {
   const overload = plannedMinutes > workMinutes;
+  const futureTasks = useMemo(() =>
+    planner.tasks
+      .filter((t) => t.date > selectedDate && t.status !== "done")
+      .sort((a, b) => priorityOrder[b.priority] - priorityOrder[a.priority])
+      .slice(0, 2),
+    [planner.tasks, selectedDate],
+  );
   const [editingTaskId, setEditingTaskId] = useState(null);
   const [editDraft, setEditDraft] = useState({ title: "", estimateMinutes: 60, priority: "medium", goalId: "" });
   const [editingBlockId, setEditingBlockId] = useState(null);
+  const [deferringQuestionId, setDeferringQuestionId] = useState(null);
+  const [deferTargetDate, setDeferTargetDate] = useState("");
   const [blockEditDraft, setBlockEditDraft] = useState({ title: "", start: "09:00", end: "10:00", type: "task" });
 
   function startEditingBlock(block) {
@@ -2632,6 +2894,18 @@ function TodayView({
       priority: task.priority,
       goalId: task.goalId || "",
     });
+  }
+
+  function fillScheduleQuestion(question) {
+    const estimateMinutes = Math.max(10, Number(question.estimateMinutes) || 30);
+    const fixedBlocks = todayBlocks.filter((b) => b.type === "busy" || (!b.taskId && !b.auto));
+    const intervals = getFreeIntervals(planner.settings, fixedBlocks);
+    const interval = intervals.find((item) => item.end - item.start >= estimateMinutes);
+    const workStart = (planner.settings.workSegments && planner.settings.workSegments[0]?.start) || planner.settings.workStart || "09:00";
+    const start = interval ? toTime(interval.start) : workStart;
+    const end = toTime(toMinutes(start) + estimateMinutes);
+    addBlockDirectly({ type: "task", taskId: question.taskId, title: "", start, end });
+    setScheduleQuestions((qs) => qs.filter((q) => q.id !== question.id));
   }
 
   function cancelEditingTask() {
@@ -2698,18 +2972,18 @@ function TodayView({
             />
           </label>
         </div>
-        <button className="primary-action" onClick={saveMorningPlan}>
-          <CheckCircle2 size={18} />
-          保存晨间规划
-        </button>
-        <div className="ai-guide-actions">
+        <div className="morning-actions">
+          <button className="primary-action" onClick={saveMorningPlan}>
+            <CheckCircle2 size={18} />
+            保存
+          </button>
           <button className="secondary-action" onClick={generateTodayAiGuide} disabled={aiStatus.loading}>
             <Sparkles size={18} />
-            {aiStatus.loading ? "AI 思考中" : "AI 今日建议"}
+            {aiStatus.loading ? "AI 思考中" : "今日建议"}
           </button>
-          {aiStatus.message && <span className="ai-message">{aiStatus.message}</span>}
-          {aiStatus.error && <span className="ai-error">{aiStatus.error}</span>}
         </div>
+        {aiStatus.message && <span className="ai-message">{aiStatus.message}</span>}
+        {aiStatus.error && <span className="ai-error">{aiStatus.error}</span>}
         {showAiFollowUp && (
           <form className="ai-followup-form" onSubmit={sendTodayAiReply}>
             <textarea
@@ -2811,13 +3085,13 @@ function TodayView({
             placeholder="回答 AI 的问题，或直接描述：今天/本周/月度/长期想推进什么"
           />
           <div className="interview-actions">
-            <button type="button" className="secondary-action" onClick={startPlanningCoach} disabled={planningCoach.loading}>
-              <Sparkles size={18} />
-              {planningCoach.loading ? "AI 思考中" : "开始访谈"}
-            </button>
             <button className="primary-action" disabled={planningCoach.loading || !planningCoach.input.trim()}>
               <Send size={18} />
               发送
+            </button>
+            <button type="button" className="secondary-action" onClick={startPlanningCoach} disabled={planningCoach.loading}>
+              <Sparkles size={18} />
+              {planningCoach.loading ? "AI 思考中" : "开始访谈"}
             </button>
           </div>
         </form>
@@ -2833,7 +3107,6 @@ function TodayView({
       <section className="panel task-panel">
         <div className="section-heading">
           <div>
-            <p className="eyebrow">任务收集</p>
             <h2>今天要做什么</h2>
           </div>
         </div>
@@ -2953,7 +3226,7 @@ function TodayView({
               }
 
               return (
-              <article className={`task-item ${task.status === "done" ? "done" : ""}${task.kind === "fixed" ? " fixed" : ""}`} key={task.id}>
+              <article className={`task-item ${task.status === "done" ? "done" : ""}${task.kind === "fixed" ? " fixed" : ""}${task.kind !== "fixed" ? " priority-" + task.priority : ""}`} key={task.id}>
                 <button
                   className="check-button"
                   title={task.status === "done" ? "标记未完成" : "标记完成"}
@@ -2982,7 +3255,7 @@ function TodayView({
                   <Pencil size={17} />
                 </button>
                 <button title="顺延到明天" className="icon-button" onClick={() => deferTask(task.id)}>
-                  <RefreshCw size={17} />
+                  <SkipForward size={17} />
                 </button>
                 <button title="删除任务" className="icon-button danger" onClick={() => deleteTask(task.id)}>
                   <Trash2 size={17} />
@@ -2990,17 +3263,43 @@ function TodayView({
               </article>
             );
             })}
+        {futureTasks.length > 0 && (
+          <>
+            <div className="future-divider">未来待办</div>
+            {futureTasks.map((task) => (
+              <article className="task-item future" key={task.id}>
+                <div className="future-placeholder" />
+                <div className="task-main">
+                  <strong>{task.title}</strong>
+                  <span className="task-meta">
+                    <span className={`priority-badge ${task.priority}`}>{priorityLabel[task.priority]}</span>
+                    <span>{task.estimateMinutes} 分钟</span>
+                    <span className="task-goal-link">{formatShortDate(task.date)}</span>
+                  </span>
+                </div>
+                <button title="编辑任务" className="icon-button" onClick={() => startEditingTask(task)}>
+                  <Pencil size={17} />
+                </button>
+                <button title="安排到今天" className="icon-button solid" onClick={() => deferTaskTo(task.id, selectedDate)}>
+                  <Plus size={17} />
+                </button>
+                <button title="删除任务" className="icon-button danger" onClick={() => deleteTask(task.id)}>
+                  <Trash2 size={17} />
+                </button>
+              </article>
+            ))}
+          </>
+        )}
         </div>
       </section>
 
       <section className="panel schedule-panel">
         <div className="section-heading">
           <div>
-            <p className="eyebrow">时间分配</p>
-            <h2>{planner.settings.workStart} - {planner.settings.workEnd}</h2>
+            <h2>时间分配</h2>
           </div>
           <button className="secondary-action" onClick={autoSchedule} disabled={aiStatus.loading}>
-            <AlarmClock size={18} />
+            <Sparkles size={18} />
             {aiStatus.loading ? "正在重新规划" : "自动安排"}
           </button>
         </div>
@@ -3037,18 +3336,17 @@ function TodayView({
           />
           <input
             name="start"
-            type="time"
+            type="time" lang="zh-CN"
             value={blockDraft.start}
             onChange={(event) => setBlockDraft((draft) => ({ ...draft, start: event.target.value }))}
           />
           <input
             name="end"
-            type="time"
+            type="time" lang="zh-CN"
             value={blockDraft.end}
             onChange={(event) => setBlockDraft((draft) => ({ ...draft, end: event.target.value }))}
           />
           <button
-            type="submit"
             title="加入时间块"
             className="compact-action solid"
             onClick={(event) => {
@@ -3065,23 +3363,50 @@ function TodayView({
           <div className="schedule-questions">
             <div>
               <strong>需要你判断放在哪里</strong>
-              <span>这些任务暂时不适合硬排，先让你定位置或补充约束。</span>
+              <span>这些任务暂时不适合自动安排。</span>
             </div>
             {scheduleQuestions.map((question) => (
               <article className="schedule-question" key={question.id}>
                 <div>
                   <strong>{question.title}</strong>
                   <span>
-                    {question.estimateMinutes} 分钟 · {question.reason} {question.hint}
+                    {question.estimateMinutes} 分钟 · {question.reason}
                   </span>
                 </div>
-                <button
-                  type="button"
-                  className="secondary-action"
-                  onClick={() => fillScheduleQuestion(question)}
-                >
-                  放入手动表单
-                </button>
+                <div className="schedule-question-actions">
+                  <button
+                    type="button"
+                    className="secondary-action"
+                    onClick={() => fillScheduleQuestion(question)}
+                  >
+                    今日
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-action"
+                    onClick={() => {
+                      setDeferringQuestionId(question.id);
+                      setDeferTargetDate(addDays(selectedDate, 1));
+                    }}
+                  >
+                    延期
+                  </button>
+                </div>
+                {deferringQuestionId === question.id && (
+                  <div className="defer-picker" style={{ gridColumn: "1 / -1" }}>
+                    <input
+                      type="date"
+                      value={deferTargetDate}
+                      onChange={(e) => setDeferTargetDate(e.target.value)}
+                    />
+                    <button className="primary-action" onClick={() => {
+                      deferTaskTo(question.taskId, deferTargetDate);
+                      setScheduleQuestions((qs) => qs.filter((q) => q.id !== question.id));
+                      setDeferringQuestionId(null);
+                    }}>确认</button>
+                    <button className="secondary-action" onClick={() => setDeferringQuestionId(null)}>取消</button>
+                  </div>
+                )}
               </article>
             ))}
           </div>
@@ -3089,71 +3414,87 @@ function TodayView({
 
         <div className="timeline">
           {todayBlocks.length === 0 && <EmptyState icon={<Clock3 size={22} />} text="还没有时间块。" />}
-          {todayBlocks.map((block) => {
+          {todayBlocks.map((block, bi) => {
             const task = taskById[block.taskId];
             const busy = block.type === "busy" || (!block.taskId && !block.auto);
             const title = task?.title || block.title || (busy ? "固定占用" : "自定义安排");
             const isEditing = editingBlockId === block.id;
+            const segs = planner.settings.workSegments || [];
+            const blockMid = toMinutes(block.start) + duration(block.start, block.end) / 2;
+            const curSegIdx = segs.findIndex((s) => blockMid >= toMinutes(s.start) && blockMid <= toMinutes(s.end));
+            let prevSegIdx = -1;
+            if (bi > 0) {
+              const prev = todayBlocks[bi - 1];
+              const prevMid = toMinutes(prev.start) + duration(prev.start, prev.end) / 2;
+              prevSegIdx = segs.findIndex((s) => prevMid >= toMinutes(s.start) && prevMid <= toMinutes(s.end));
+            }
+            const showDivider = prevSegIdx >= 0 && curSegIdx >= 0 && prevSegIdx !== curSegIdx;
 
             if (isEditing) {
               return (
-                <article className="time-block editing" key={block.id}>
-                  <div className="block-edit-form">
-                    <div className="block-edit-row">
-                      <input
-                        type="time"
-                        value={blockEditDraft.start}
-                        onChange={(e) => setBlockEditDraft((d) => ({ ...d, start: e.target.value }))}
-                        aria-label="开始时间"
-                      />
-                      <input
-                        type="time"
-                        value={blockEditDraft.end}
-                        onChange={(e) => setBlockEditDraft((d) => ({ ...d, end: e.target.value }))}
-                        aria-label="结束时间"
-                      />
-                      <select
-                        value={blockEditDraft.type}
-                        onChange={(e) => setBlockEditDraft((d) => ({ ...d, type: e.target.value }))}
-                      >
-                        <option value="task">任务</option>
-                        <option value="busy">不可用</option>
-                      </select>
+                <React.Fragment key={block.id}>
+                  {showDivider && (
+                    <div className="time-segment-divider">
+                      {segs[prevSegIdx].start}-{segs[prevSegIdx].end} ↑ {segs[curSegIdx].start}-{segs[curSegIdx].end} ↓
                     </div>
-                    <input
-                      value={blockEditDraft.title}
-                      onChange={(e) => setBlockEditDraft((d) => ({ ...d, title: e.target.value }))}
-                      placeholder="标题（可选）"
-                    />
-                    <div className="edit-task-actions">
-                      <button className="secondary-action" onClick={() => saveEditingBlock(block.id)}>保存</button>
-                      <button className="secondary-action" onClick={cancelEditingBlock}>取消</button>
+                  )}
+                  <article className="time-block editing">
+                    <div className="block-edit-form">
+                      <div className="block-edit-row">
+                        <input type="time" lang="zh-CN" value={blockEditDraft.start}
+                          onChange={(e) => setBlockEditDraft((d) => ({ ...d, start: e.target.value }))} aria-label="开始时间" />
+                        <input type="time" lang="zh-CN" value={blockEditDraft.end}
+                          onChange={(e) => setBlockEditDraft((d) => ({ ...d, end: e.target.value }))} aria-label="结束时间" />
+                        <select value={blockEditDraft.type}
+                          onChange={(e) => setBlockEditDraft((d) => ({ ...d, type: e.target.value }))}>
+                          <option value="task">任务</option>
+                          <option value="busy">不可用</option>
+                        </select>
+                      </div>
+                      <input value={blockEditDraft.title}
+                        onChange={(e) => setBlockEditDraft((d) => ({ ...d, title: e.target.value }))} placeholder="标题（可选）" />
+                      <div className="edit-task-actions">
+                        <button className="secondary-action" onClick={() => saveEditingBlock(block.id)}>保存</button>
+                        <button className="secondary-action" onClick={cancelEditingBlock}>取消</button>
+                      </div>
                     </div>
-                  </div>
-                </article>
+                  </article>
+                </React.Fragment>
               );
             }
 
+            let priorityClass = "";
+            if (busy || task?.kind === "fixed") { priorityClass = "tb-fixed"; }
+            else if (task) { priorityClass = `tb-${task.priority}`; }
+            else if (block.auto) { priorityClass = "tb-auto"; }
+
             return (
-              <article className={`time-block ${block.auto ? "auto" : ""} ${busy ? "busy" : ""}`} key={block.id}>
-                <div className="time-range">
-                  <strong>{block.start}</strong>
-                  <span>{block.end}</span>
-                </div>
-                <div className="time-body">
-                  <strong>{title}</strong>
-                  <span>
-                    {duration(block.start, block.end)} 分钟
-                    {busy ? " · 不可安排" : block.auto ? " · 自动" : ""}
-                  </span>
-                </div>
-                <button title="编辑时间块" className="icon-button" onClick={() => startEditingBlock(block)}>
-                  <Pencil size={17} />
-                </button>
-                <button title="删除时间块" className="icon-button danger" onClick={() => deleteBlock(block.id)}>
-                  <Trash2 size={17} />
-                </button>
-              </article>
+              <React.Fragment key={block.id}>
+                {showDivider && (
+                  <div className="time-segment-divider">
+                    {segs[prevSegIdx].start}-{segs[prevSegIdx].end} ↑ {segs[curSegIdx].start}-{segs[curSegIdx].end} ↓
+                  </div>
+                )}
+                <article className={`time-block ${priorityClass}`}>
+                  <div className="time-range">
+                    <strong>{block.start}</strong>
+                    <span>{block.end}</span>
+                  </div>
+                  <div className="time-body">
+                    <strong>{title}</strong>
+                    <span>
+                      {duration(block.start, block.end)} 分钟
+                      {busy ? " · 不可安排" : block.auto ? " · 自动" : ""}
+                    </span>
+                  </div>
+                  <button title="编辑时间块" className="icon-button" onClick={() => startEditingBlock(block)}>
+                    <Pencil size={17} />
+                  </button>
+                  <button title="删除时间块" className="icon-button danger" onClick={() => deleteBlock(block.id)}>
+                    <Trash2 size={17} />
+                  </button>
+                </article>
+              </React.Fragment>
             );
           })}
         </div>
