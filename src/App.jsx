@@ -1019,6 +1019,18 @@ function usePlannerStore() {
       .finally(() => setLoaded(true));
   }, []);
 
+  // compact tasks/blocks on mount and after data load
+  useEffect(() => {
+    setState((current) => {
+      const compacted = compactPlannerTasks(current.tasks, current.blocks);
+      const tasksChanged = compacted.tasks.length !== current.tasks.length;
+      const blocksChanged =
+        compacted.blocks.length !== current.blocks.length ||
+        compacted.blocks.some((block, index) => block !== current.blocks[index]);
+      return tasksChanged || blocksChanged ? { ...current, ...compacted } : current;
+    });
+  }, [loaded]);
+
   // save to localStorage immediately, debounce to file
   useEffect(() => {
     if (!loaded) return;
@@ -1459,17 +1471,6 @@ function App() {
   const [showSegmentModal, setShowSegmentModal] = useState(false);
   const [segmentDraft, setSegmentDraft] = useState({ start: "09:00", end: "12:00" });
   const dayNames = ["日", "一", "二", "三", "四", "五", "六"];
-
-  useEffect(() => {
-    setPlanner((current) => {
-      const compacted = compactPlannerTasks(current.tasks, current.blocks);
-      const tasksChanged = compacted.tasks.length !== current.tasks.length;
-      const blocksChanged =
-        compacted.blocks.length !== current.blocks.length ||
-        compacted.blocks.some((block, index) => block !== current.blocks[index]);
-      return tasksChanged || blocksChanged ? { ...current, ...compacted } : current;
-    });
-  }, [setPlanner, loaded]);
 
   useEffect(() => {
     setScheduleQuestions([]);
