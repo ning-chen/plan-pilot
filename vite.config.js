@@ -76,6 +76,7 @@ function expandRecurring(items, existingBlocks) {
 
   items.forEach((item) => {
     if (!item.dayOfWeek && item.dayOfWeek !== 0) return;
+    if (item.dayOfWeek < 0 || item.dayOfWeek > 6) return;
     const cursor = new Date(today.getFullYear(), today.getMonth(), today.getDate());
     const endDate = item.endDate ? new Date(item.endDate + "T00:00:00") : null;
 
@@ -169,50 +170,7 @@ function saveAllData(data) {
   // recurring
   writeJson(RECURRING_FILE, Array.isArray(data.recurring) ? data.recurring : []);
 
-  // group daily items by week
-  const weeks = {};
-  function weekFile(dateStr) {
-    const key = weekFileName(dateStr);
-    if (!weeks[key]) {
-      const existing = readJson(path.join(DAILY_DIR, key)) || {};
-      weeks[key] = {
-        tasks: existing.tasks || [],
-        blocks: existing.blocks || [],
-        dayPlans: existing.dayPlans || {},
-        reviews: existing.reviews || [],
-      };
-    }
-    return weeks[key];
-  }
-
-  // tasks by week
-  const taskById = {};
-  (data.tasks || []).forEach((t) => {
-    if (t.date) {
-      const wf = weekFile(t.date);
-      taskById[t.id] = t;
-    }
-  });
-  // blocks by week
-  (data.blocks || []).forEach((b) => {
-    if (b.date) {
-      weekFile(b.date);
-    }
-  });
-  // dayPlans by week
-  if (data.dayPlans) {
-    Object.entries(data.dayPlans).forEach(([date, plan]) => {
-      weekFile(date);
-    });
-  }
-  // reviews by week
-  (data.reviews || []).forEach((r) => {
-    if (r.date) {
-      weekFile(r.date);
-    }
-  });
-
-  // Now rebuild each week file with the new data that belongs to it
+  // group daily items by week and write each week file
   const weekDates = {};
   // Collect all dates that have tasks, blocks, dayPlans, or reviews
   (data.tasks || []).forEach((t) => { if (t.date) weekDates[t.date] = true; });
@@ -347,10 +305,19 @@ function filterDayPlans(dayPlans, weekStart, weekEnd) {
   return result;
 }
 
-function readBody(req) {
+function readBody(req, maxBytes = 5 * 1024 * 1024) {
   return new Promise((resolve, reject) => {
     const chunks = [];
-    req.on("data", (chunk) => chunks.push(chunk));
+    let total = 0;
+    req.on("data", (chunk) => {
+      total += chunk.length;
+      if (total > maxBytes) {
+        req.destroy();
+        reject(new Error("Request body too large"));
+        return;
+      }
+      chunks.push(chunk);
+    });
     req.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
     req.on("error", reject);
   });
@@ -386,7 +353,10 @@ function toAnthropicMessages(messages = []) {
     .filter((message) => message.role !== "system")
     .forEach((message) => {
       const role = message.role === "assistant" ? "assistant" : "user";
-      const content = String(message.content || "");
+      const raw = message.content;
+      const content = Array.isArray(raw)
+        ? raw.filter((p) => p.type === "text").map((p) => p.text).join("\n")
+        : String(raw || "");
       const previous = turns[turns.length - 1];
 
       if (previous?.role === role) {
