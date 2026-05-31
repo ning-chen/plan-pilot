@@ -817,12 +817,12 @@ function defaultBusyDuration(sentence) {
 
 function isBusySentence(sentence) {
   if (/购买|买票|订票|预订|查票|抢票/.test(sentence)) return false;
-  return /会议|开会|课题会|组会|例会|研讨会|讨论|探讨|汇报|会谈|监考|考试|上课|答辩|面试|出发|前往|返回|通勤|火车|高铁|航班|去|外出|办事|接人|送|医院|体检|银行|办理|聚餐|午饭|午休|休息|赴|参观|出差|请假/.test(sentence);
+  return /会议|开会|开[^，。；;\n]{1,24}会|课题会|组会|例会|研讨会|讨论|探讨|汇报|会谈|监考|考试|上课|答辩|面试|出发|前往|返回|通勤|火车|高铁|航班|去|外出|办事|接人|送|医院|体检|银行|办理|聚餐|午饭|午休|休息|赴|参观|出差|请假/.test(sentence);
 }
 
 function isMeetingSentence(sentence) {
   if (/购买|买票|订票|预订|查票|抢票/.test(sentence)) return false;
-  return /会议|开会|课题会|组会|例会|研讨会|讨论|探讨|汇报|会谈/.test(sentence);
+  return /会议|开会|开[^，。；;\n]{1,24}会|课题会|组会|例会|研讨会|讨论|探讨|汇报|会谈/.test(sentence);
 }
 
 function isPostMeetingTask(title) {
@@ -949,6 +949,29 @@ function extractBusyBlocksFromText(text, date, existingBlocks = []) {
       existingKeys.add(key);
       return true;
     });
+}
+
+function extractCoachBusyItemsFromText(text, selectedDate, existingBlocks = []) {
+  const recoveredBlocks = [];
+
+  String(text || "")
+    .split(/[\n。；;]/)
+    .map(normalizeSentence)
+    .filter(Boolean)
+    .forEach((sentence) => {
+      const date = inferDateFromText(sentence, selectedDate);
+      extractBusyBlocksFromText(sentence, date, existingBlocks.concat(recoveredBlocks)).forEach((block) => {
+        recoveredBlocks.push(block);
+      });
+    });
+
+  return recoveredBlocks.map((block) => ({
+    kind: "busy",
+    title: block.title,
+    date: block.date,
+    start: block.start,
+    end: block.end,
+  }));
 }
 
 function extractTimedTasksFromText(text, date, existingTasks = []) {
@@ -2293,7 +2316,7 @@ function App() {
           {
             role: "system",
             content:
-              "对话策略：每次回答后判断是否还需追问；不重复用户原文；会议前后分别安排准备和总结任务；用 busy 块标注固定时间占用。",
+              "对话策略：每次回答后判断是否还需追问；不重复用户原文；会议前后分别安排准备和总结任务；用户明确提供且尚未存在于 timeBlocks 的固定安排必须作为 kind=\"busy\" 返回，不能只当作上下文使用。",
             },
             {
               role: "system",
@@ -2326,7 +2349,17 @@ function App() {
         ],
       });
 
-      const normalizedItems = attachKnownGoalReferences(normalizeCoachItems(collectCoachItems(result), selectedDate), planner);
+      const userPlanningContext = [
+        dayPlan.fixed,
+        ...nextMessages.filter((message) => message.role === "user").map((message) => message.content),
+      ]
+        .filter(Boolean)
+        .join("\n");
+      const recoveredBusyItems = extractCoachBusyItemsFromText(userPlanningContext, selectedDate, planner.blocks);
+      const normalizedItems = attachKnownGoalReferences(
+        normalizeCoachItems(collectCoachItems(result).concat(recoveredBusyItems), selectedDate),
+        planner,
+      );
       const items = filterCoachItems(normalizedItems, planner);
       setPlanningCoach((coach) => ({
         ...coach,
