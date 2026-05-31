@@ -397,14 +397,19 @@ function openAiBody(payload) {
 }
 
 async function callOpenAiCompatible(payload, apiKey) {
-  return fetch(chatCompletionUrl(payload.baseUrl), {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 60_000);
+  const response = await fetch(chatCompletionUrl(payload.baseUrl), {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${apiKey}`,
     },
     body: JSON.stringify(openAiBody(payload)),
+    signal: controller.signal,
   });
+  clearTimeout(timer);
+  return response;
 }
 
 async function callAnthropic(payload, apiKey) {
@@ -417,6 +422,8 @@ async function callAnthropic(payload, apiKey) {
 
   if (converted.system) body.system = converted.system;
 
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 60_000);
   const upstream = await fetch(anthropicMessagesUrl(payload.baseUrl), {
     method: "POST",
     headers: {
@@ -425,7 +432,9 @@ async function callAnthropic(payload, apiKey) {
       "anthropic-version": payload.anthropicVersion || "2023-06-01",
     },
     body: JSON.stringify(body),
+    signal: controller.signal,
   });
+  clearTimeout(timer);
 
   const text = await upstream.text();
   let output = text;
