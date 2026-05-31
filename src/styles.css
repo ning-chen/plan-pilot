@@ -1443,7 +1443,7 @@ textarea {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  transition: opacity 0.2s, box-shadow 0.2s, border-color 0.2s;
+  transition: opacity 0.2s, box-shadow 0.2s, border-color 0.2s, border-left-color 0.2s;
   align-items: stretch;
 }
 
