@@ -211,11 +211,11 @@ function saveAllData(data) {
       } else {
         const content = readJson(filePath);
         if (
-          content &&
-          !(content.tasks || []).length &&
-          !(content.blocks || []).length &&
-          !Object.keys(content.dayPlans || {}).length &&
-          !(content.reviews || []).length
+          !content ||
+          (!(content.tasks || []).length &&
+           !(content.blocks || []).length &&
+           !Object.keys(content.dayPlans || {}).length &&
+           !(content.reviews || []).length)
         ) {
           fs.unlinkSync(filePath);
         }
@@ -293,7 +293,7 @@ function saveAllData(data) {
       if (!name.endsWith(".json")) continue;
       const filePath = path.join(dir, name);
       const content = readJson(filePath);
-      if (content && !(content.goals || []).length) {
+      if (!content || !(content.goals || []).length) {
         fs.unlinkSync(filePath);
       }
     }
