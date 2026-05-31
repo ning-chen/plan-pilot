@@ -1412,6 +1412,8 @@ function buildAutoBlocks({ tasks, existingBlocks, settings, selectedDate }) {
   };
 }
 
+let _autoScheduling = false;
+
 function App() {
   const [planner, setPlanner] = usePlannerStore();
   const [aiKeyLoaded, setAiKeyLoaded] = useState(false);
@@ -1751,7 +1753,10 @@ function App() {
   }
 
   async function autoSchedule() {
-    const prepared = preparePlannerForScheduling({
+    if (_autoScheduling) return;
+    _autoScheduling = true;
+    try {
+      const prepared = preparePlannerForScheduling({
       tasks: planner.tasks,
       blocks: planner.blocks,
       settings: planner.settings,
@@ -1842,6 +1847,9 @@ function App() {
         error: "",
         message: `AI 排期失败（${error.message}），已使用规则安排。`,
       });
+    }
+    } finally {
+      _autoScheduling = false;
     }
   }
 
