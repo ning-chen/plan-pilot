@@ -17,7 +17,25 @@ self.addEventListener("activate", (event) => {
 
 self.addEventListener("fetch", (event) => {
   if (event.request.method !== "GET") return;
-  event.respondWith(
-    caches.match(event.request).then((cached) => cached || fetch(event.request)),
-  );
+
+  const url = new URL(event.request.url);
+  const isApi = url.pathname.startsWith("/api/");
+
+  if (isApi) {
+    // Network-first for API routes — never serve stale data
+    event.respondWith(
+      fetch(event.request)
+        .then((response) => {
+          const clone = response.clone();
+          caches.open(CACHE_NAME).then((cache) => cache.put(event.request, clone));
+          return response;
+        })
+        .catch(() => caches.match(event.request)),
+    );
+  } else {
+    // Cache-first for static assets
+    event.respondWith(
+      caches.match(event.request).then((cached) => cached || fetch(event.request)),
+    );
+  }
 });
