@@ -404,7 +404,7 @@ textarea {
   font-weight: 700;
 }
 
-.data-panel input {
+.data-panel input[type="file"] {
   display: none;
 }
 
@@ -511,17 +511,19 @@ textarea {
 
 .topbar-highlight {
   display: inline-flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 4px;
   min-height: 26px;
-  max-width: 280px;
+  max-width: 360px;
   padding: 3px 10px;
   border-radius: 6px;
   font-size: 12px;
   font-weight: 700;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.topbar-highlight svg {
+  flex-shrink: 0;
 }
 
 .topbar-highlight.week {
@@ -1245,11 +1247,6 @@ textarea {
   grid-template-columns: 92px minmax(0, 1fr) 40px 40px;
 }
 
-.time-block.editing {
-  grid-template-columns: 1fr;
-  padding: 14px;
-}
-
 .block-edit-form {
   display: grid;
   gap: 10px;
@@ -1307,6 +1304,7 @@ textarea {
 
 .time-block.editing {
   grid-template-columns: 1fr;
+  padding: 14px;
   align-items: stretch;
   background: #fbf9f4;
 }
