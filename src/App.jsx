@@ -1172,7 +1172,7 @@ function normalizeScheduleQuestions(items, taskById) {
       questions.findIndex(
         (candidate) =>
           (item.taskId && candidate.taskId === item.taskId) ||
-          titlesReferToSameTask(candidate.title, item.title),
+          (!item.taskId && !candidate.taskId && titlesReferToSameTask(candidate.title, item.title)),
       ) === index,
   );
 }
