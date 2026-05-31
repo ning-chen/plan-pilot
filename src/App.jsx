@@ -1469,7 +1469,7 @@ function App() {
         compacted.blocks.some((block, index) => block !== current.blocks[index]);
       return tasksChanged || blocksChanged ? { ...current, ...compacted } : current;
     });
-  }, [setPlanner]);
+  }, [setPlanner, loaded]);
 
   useEffect(() => {
     setScheduleQuestions([]);
