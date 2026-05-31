@@ -2517,16 +2517,19 @@ function App() {
 
   function carryUnfinished() {
     const tomorrow = addDays(selectedDate, 1);
-    patchPlanner((current) => ({
-      tasks: current.tasks.map((task) =>
+    patchPlanner((current) => {
+      const updatedTasks = current.tasks.map((task) =>
         task.date === selectedDate && task.status !== "done"
           ? { ...task, date: tomorrow, status: "open" }
           : task,
-      ),
-      blocks: current.blocks.filter(
-        (block) => block.date !== selectedDate || current.tasks.find((t) => t.id === block.taskId)?.status === "done",
-      ),
-    }));
+      );
+      return {
+        tasks: updatedTasks,
+        blocks: current.blocks.filter(
+          (block) => block.date !== selectedDate || updatedTasks.find((t) => t.id === block.taskId)?.status === "done",
+        ),
+      };
+    });
     setSelectedDate(tomorrow);
   }
 
