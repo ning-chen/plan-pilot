@@ -514,8 +514,11 @@ function titleLooksDuplicate(a, b) {
   const aGrams = new Set(titleBigrams(a));
   const bGrams = new Set(titleBigrams(b));
   if (!aGrams.size || !bGrams.size) return false;
+  const smallerSize = Math.min(aGrams.size, bGrams.size);
+  // Require higher overlap for very short titles (few unique bigrams)
+  const threshold = smallerSize < 4 ? 0.95 : 0.78;
   const overlap = [...aGrams].filter((gram) => bGrams.has(gram)).length;
-  return overlap / Math.min(aGrams.size, bGrams.size) >= 0.78;
+  return overlap / smallerSize >= threshold;
 }
 
 function titlesReferToSameTask(a, b) {
@@ -1034,7 +1037,7 @@ function usePlannerStore() {
   // save to localStorage immediately, debounce to file
   useEffect(() => {
     if (!loaded) return;
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); } catch (e) { console.error("localStorage write failed:", e); }
     clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => {
       fetch("/api/data", {
@@ -2439,6 +2442,9 @@ function App() {
         window.alert("导入失败：JSON 格式不正确。");
       }
     };
+    reader.onerror = () => {
+      window.alert("导入失败：文件读取错误。");
+    };
     reader.readAsText(file);
     event.target.value = "";
   }
@@ -2565,14 +2571,14 @@ function App() {
 
         <section className="settings-panel">
           <div className="work-segments-label">工作时段</div>
-          {(planner.settings.workSegments || []).map((seg, i) => (
-            <div className="work-segment-item" key={i}>
+          {(planner.settings.workSegments || []).map((seg) => (
+            <div className="work-segment-item" key={`${seg.start}-${seg.end}`}>
               <span>{seg.start} - {seg.end}</span>
               <button className="icon-button" onClick={() => {
                 patchPlanner((current) => ({
                   settings: {
                     ...current.settings,
-                    workSegments: current.settings.workSegments.filter((_, idx) => idx !== i),
+                    workSegments: current.settings.workSegments.filter((s) => s.start !== seg.start || s.end !== seg.end),
                   },
                 }));
               }}>
