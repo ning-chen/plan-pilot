@@ -344,7 +344,13 @@ function shouldForwardThinking(payload) {
 function toAnthropicMessages(messages = []) {
   const system = messages
     .filter((message) => message.role === "system")
-    .map((message) => message.content)
+    .map((message) => {
+      const raw = message.content;
+      if (Array.isArray(raw)) {
+        return raw.filter((p) => p.type === "text").map((p) => p.text).join("\n");
+      }
+      return String(raw || "");
+    })
     .filter(Boolean)
     .join("\n\n");
 
