@@ -1054,7 +1054,7 @@ function getProtectedBreaks(settings) {
   return breaks;
 }
 
-function polishAiBlocks(blocks, segments, today) {
+function polishAiBlocks(blocks, segments) {
   if (!blocks.length || !segments.length) return blocks;
   const MIN_KEEP = 10;
 
@@ -1764,7 +1764,8 @@ function App() {
         settings: planner.settings,
         selectedDate,
       });
-      patchPlanner({ blocks: result.blocks, tasks: result.tasks || prepared.tasks });
+      const polished = polishAiBlocks(result.blocks, planner.settings.workSegments).filter((b) => !b._drop);
+      patchPlanner({ blocks: polished, tasks: result.tasks || prepared.tasks });
       setScheduleQuestions(result.questions);
       return;
     }
@@ -1812,7 +1813,8 @@ function App() {
         settings: planner.settings,
         selectedDate,
       });
-      patchPlanner({ tasks: schedule.tasks, blocks: schedule.blocks });
+      const polished = polishAiBlocks(schedule.blocks, planner.settings.workSegments).filter((b) => !b._drop);
+      patchPlanner({ tasks: schedule.tasks, blocks: polished });
       setScheduleQuestions(schedule.questions);
       setAiStatus({
         loading: false,
@@ -1828,7 +1830,8 @@ function App() {
         settings: planner.settings,
         selectedDate,
       });
-      patchPlanner({ blocks: result.blocks, tasks: result.tasks || prepared.tasks });
+      const polished = polishAiBlocks(result.blocks, planner.settings.workSegments).filter((b) => !b._drop);
+      patchPlanner({ blocks: polished, tasks: result.tasks || prepared.tasks });
       setScheduleQuestions(result.questions);
       setAiStatus({
         loading: false,
