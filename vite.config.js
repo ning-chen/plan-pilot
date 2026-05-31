@@ -71,23 +71,22 @@ function expandRecurring(items, existingBlocks) {
   const blocks = [];
   const today = new Date();
   const existingKeys = new Set(
-    existingBlocks.map((b) => `${b.date}|${b.start}|${b.title || ""}`)
+    existingBlocks.map((b) => `${b.date}|${b.start}|${b.taskId || b.title || ""}`)
   );
 
   items.forEach((item) => {
     if (!item.dayOfWeek && item.dayOfWeek !== 0) return;
-    const endDate = item.endDate ? new Date(item.endDate) : null;
-    const cursor = new Date(today);
+    const cursor = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+    const endDate = item.endDate ? new Date(item.endDate + "T00:00:00") : null;
 
     // expand up to endDate or 1 year from now
-    const limit = endDate && endDate < new Date(today.getFullYear() + 1, today.getMonth(), today.getDate())
-      ? endDate
-      : new Date(today.getFullYear() + 1, today.getMonth(), today.getDate());
+    const maxDate = new Date(today.getFullYear() + 1, today.getMonth(), today.getDate());
+    const limit = endDate && endDate < maxDate ? endDate : maxDate;
 
     while (cursor <= limit) {
       if (cursor.getDay() === item.dayOfWeek) {
         const ds = formatDate(cursor);
-        const key = `${ds}|${item.start}|${item.title}`;
+        const key = `${ds}|${item.start}|${item.taskId || item.title}`;
         if (!existingKeys.has(key)) {
           blocks.push({
             id: `rec-${item.id || ""}-${ds}`,
@@ -163,12 +162,12 @@ function loadAllData() {
 
 function saveAllData(data) {
   // config
-  writeJson(CONFIG_FILE, { settings: data.settings || {}, ai: data.ai || {} });
+  const safeAi = { ...(data.ai || {}) };
+  delete safeAi.apiKey;
+  writeJson(CONFIG_FILE, { settings: data.settings || {}, ai: safeAi });
 
   // recurring
-  if (Array.isArray(data.recurring)) {
-    writeJson(RECURRING_FILE, data.recurring);
-  }
+  writeJson(RECURRING_FILE, Array.isArray(data.recurring) ? data.recurring : []);
 
   // group daily items by week
   const weeks = {};
@@ -238,6 +237,28 @@ function saveAllData(data) {
     });
   });
 
+  // Clean up: remove weekly files that are no longer in the active set or are empty
+  if (fs.existsSync(DAILY_DIR)) {
+    for (const name of fs.readdirSync(DAILY_DIR)) {
+      if (!name.endsWith(".json")) continue;
+      const filePath = path.join(DAILY_DIR, name);
+      if (!weekFiles.has(name)) {
+        fs.unlinkSync(filePath);
+      } else {
+        const content = readJson(filePath);
+        if (
+          content &&
+          !(content.tasks || []).length &&
+          !(content.blocks || []).length &&
+          !Object.keys(content.dayPlans || {}).length &&
+          !(content.reviews || []).length
+        ) {
+          fs.unlinkSync(filePath);
+        }
+      }
+    }
+  }
+
   // goals
   const monthGoals = {};
   const yearGoals = {};
@@ -299,6 +320,19 @@ function saveAllData(data) {
       else updated.push(g);
     });
     writeJson(path.join(GOALS_LONGTERM_DIR, `${yk}.json`), { year: yk, goals: updated });
+  });
+
+  // Clean up: remove empty goal files
+  [GOALS_MONTHLY_DIR, GOALS_LONGTERM_DIR].forEach((dir) => {
+    if (!fs.existsSync(dir)) return;
+    for (const name of fs.readdirSync(dir)) {
+      if (!name.endsWith(".json")) continue;
+      const filePath = path.join(dir, name);
+      const content = readJson(filePath);
+      if (content && !(content.goals || []).length) {
+        fs.unlinkSync(filePath);
+      }
+    }
   });
 
   // index
