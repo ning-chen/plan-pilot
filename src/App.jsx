@@ -2730,10 +2730,12 @@ function App() {
                 <button className="secondary-action" onClick={() => { setShowRecurringModal(false); setEditingRecurringId(null); }}>取消</button>
                 <button className="primary-action" onClick={() => {
                   if (!recurringDraft.title.trim()) return;
-                  if (editingRecurringId) {
-                    deleteRecurring(editingRecurringId);
-                  }
-                  addRecurring({ id: editingRecurringId || uid("rec"), ...recurringDraft });
+                  const editId = editingRecurringId;
+                  patchPlanner((current) => ({
+                    recurring: (current.recurring || [])
+                      .filter((r) => !editId || r.id !== editId)
+                      .concat({ id: editId || uid("rec"), ...recurringDraft }),
+                  }));
                   setRecurringDraft({ title: "", start: "09:00", end: "10:00", dayOfWeek: 1, endDate: "" });
                   setShowRecurringModal(false);
                   setEditingRecurringId(null);
