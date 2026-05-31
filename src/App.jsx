@@ -1269,6 +1269,7 @@ function getFreeIntervals(settings, fixedBlocks, options = {}) {
     let cursor = segStart;
 
     fixed.forEach((block) => {
+      if (block.end <= segStart || block.start >= segEnd) return;
       if (block.start > cursor && block.start < segEnd) {
         intervals.push({ start: cursor, end: Math.min(block.start, segEnd), segment: seg });
       }
@@ -1288,6 +1289,40 @@ function overlapsAny(block, blocks) {
   const start = toMinutes(block.start);
   const end = toMinutes(block.end);
   return blocks.some((item) => start < toMinutes(item.end) && end > toMinutes(item.start));
+}
+
+function reconcileScheduleBlocks(blocks, settings, selectedDate) {
+  const protectedBreaks = getProtectedBreaks(settings);
+  const todayBlocks = sortBlocks(blocks.filter((block) => block.date === selectedDate));
+  const busyBlocks = todayBlocks.filter((block) => block.type === "busy");
+  const taskBlocks = todayBlocks.filter((block) => block.type !== "busy");
+  const removedBlockIds = new Set();
+  const removedTaskIds = new Set();
+
+  function remove(block) {
+    removedBlockIds.add(block.id);
+    if (block.taskId) removedTaskIds.add(block.taskId);
+  }
+
+  taskBlocks.forEach((block) => {
+    if (!isInsideWorkWindow(block, settings) || overlapsAny(block, protectedBreaks) || overlapsAny(block, busyBlocks)) {
+      remove(block);
+    }
+  });
+
+  taskBlocks.forEach((block, index) => {
+    if (removedBlockIds.has(block.id)) return;
+    taskBlocks.slice(index + 1).forEach((candidate) => {
+      if (removedBlockIds.has(candidate.id) || !overlapsAny(block, [candidate])) return;
+      remove(block);
+      remove(candidate);
+    });
+  });
+
+  return {
+    blocks: blocks.filter((block) => !removedBlockIds.has(block.id)),
+    removedTaskIds: [...removedTaskIds],
+  };
 }
 
 function isInsideWorkWindow(block, settings) {
@@ -1415,10 +1450,16 @@ function normalizeAiScheduleResult(result, { tasks, existingBlocks, settings, se
     });
   });
 
-  return {
-    blocks: existingBlocks
+  const reconciled = reconcileScheduleBlocks(
+    existingBlocks
       .filter((block) => !(block.date === selectedDate && block.auto))
       .concat(autoBlocks),
+    settings,
+    selectedDate,
+  );
+
+  return {
+    blocks: reconciled.blocks,
     tasks: adjustedTasks,
     questions,
     message: result?.message || "",
@@ -1427,20 +1468,12 @@ function normalizeAiScheduleResult(result, { tasks, existingBlocks, settings, se
 
 function preparePlannerForScheduling({ tasks, blocks, settings, selectedDate }) {
   const compacted = compactPlannerTasks(tasks, blocks);
-  const protectedBreaks = getProtectedBreaks(settings);
-  const busyBlocks = compacted.blocks.filter((block) => block.date === selectedDate && block.type === "busy");
-  const removedTaskIds = [];
-  const preparedBlocks = compacted.blocks.filter((block) => {
-    if (block.date !== selectedDate || block.auto || block.type === "busy" || !block.taskId) return true;
-    const invalid = !isInsideWorkWindow(block, settings) || overlapsAny(block, protectedBreaks) || overlapsAny(block, busyBlocks);
-    if (invalid) removedTaskIds.push(block.taskId);
-    return !invalid;
-  });
+  const reconciled = reconcileScheduleBlocks(compacted.blocks, settings, selectedDate);
 
   return {
     tasks: compacted.tasks,
-    blocks: preparedBlocks,
-    removedTaskIds,
+    blocks: reconciled.blocks,
+    removedTaskIds: reconciled.removedTaskIds,
   };
 }
 
@@ -1536,10 +1569,16 @@ function buildAutoBlocks({ tasks, existingBlocks, settings, selectedDate }) {
     });
   });
 
-  return {
-    blocks: existingBlocks
+  const reconciled = reconcileScheduleBlocks(
+    existingBlocks
       .filter((block) => !(block.date === selectedDate && block.auto))
       .concat(autoBlocks),
+    settings,
+    selectedDate,
+  );
+
+  return {
+    blocks: reconciled.blocks,
     questions,
   };
 }
@@ -2009,6 +2048,31 @@ function App() {
     submitBlockForm(event.currentTarget);
   }
 
+  function addBlockDirectly(data) {
+    const nextBlock = {
+      id: uid("block"),
+      taskId: data.type === "busy" ? "" : data.taskId,
+      title: data.title || (data.type === "busy" ? "固定占用" : ""),
+      type: data.type,
+      date: selectedDate,
+      start: data.start,
+      end: data.end,
+      auto: false,
+    };
+    if (toMinutes(nextBlock.end) <= toMinutes(nextBlock.start)) return false;
+    if (nextBlock.type !== "busy" && !isInsideWorkWindow(nextBlock, planner.settings)) return false;
+    if (nextBlock.type !== "busy" && overlapsAny(nextBlock, getProtectedBreaks(planner.settings))) return false;
+    if (planner.blocks.some((block) => block.date === selectedDate && overlapsAny(nextBlock, [block]))) return false;
+
+    patchPlanner((current) => ({
+      blocks: current.blocks.concat(nextBlock),
+    }));
+    if (nextBlock.taskId) {
+      setScheduleQuestions((questions) => questions.filter((question) => question.taskId !== nextBlock.taskId));
+    }
+    return true;
+  }
+
   function submitBlockForm(form) {
     const start = String(fieldValue(form, "start", blockDraft.start));
     const end = String(fieldValue(form, "end", blockDraft.end));
@@ -2265,7 +2329,7 @@ function App() {
           {
             role: "system",
             content:
-              "你是 Plan Pilot 的今日建议助手。基于用户精力、固定安排、目标和已有任务，给出具体可执行的新任务，仅返回 JSON：{\"message\":\"提醒或追问\",\"tasks\":[{\"title\":\"...\",\"estimateMinutes\":45,\"priority\":\"high|medium|low\",\"goalId\":\"可选\",\"reason\":\"为什么\"}]}。约束：不重复已有任务；保护固定时间块；计划不清时 tasks:[] 并用 message 提 1-3 个追问（中文）；复杂设计任务≥180分钟；区分购票执行时间与出行时间，注意打印→扫描→上传等依赖顺序。",
+              "你是 Plan Pilot 的今日建议助手。基于用户精力、固定安排、目标和已有任务，给出具体可执行的新任务，仅返回 JSON：{\"message\":\"提醒或追问\",\"tasks\":[{\"title\":\"...\",\"estimateMinutes\":45,\"priority\":\"high|medium|low\",\"goalId\":\"可选\",\"reason\":\"为什么\"}]}。约束：只在确实缺少下一步时新增任务，不重复已有任务；如果已有任务已经足够，tasks:[]，message 明确说明无需新增并建议点击自动安排；保护固定时间块；计划不清时 tasks:[] 并用 message 提 1-3 个追问（中文）；复杂设计任务≥180分钟；区分购票执行时间与出行时间，注意打印→扫描→上传等依赖顺序。",
           },
           {
             role: "user",
@@ -2283,19 +2347,22 @@ function App() {
         ],
       });
       const validGoalIds = new Set(activeGoals.map((goal) => goal.id));
-      const suggestions = filterTaskSuggestions(
-        normalizeTaskSuggestions(result.tasks, selectedDate).map((task) => ({
-          ...task,
-          goalId: validGoalIds.has(task.goalId) ? task.goalId : "",
-        })),
-        planner.tasks,
-      );
+      const rawSuggestions = normalizeTaskSuggestions(result.tasks, selectedDate).map((task) => ({
+        ...task,
+        goalId: validGoalIds.has(task.goalId) ? task.goalId : "",
+      }));
+      const suggestions = filterTaskSuggestions(rawSuggestions, planner.tasks);
       if (!suggestions.length) {
+        const noNewTaskNote = rawSuggestions.length
+          ? "模型给出的任务均已存在，因此没有重复新增。可点击“自动安排”重新分配现有任务。"
+          : todayTasks.length
+            ? "当前没有需要新增的任务。可点击“自动安排”重新分配现有任务。"
+            : "当前没有生成可加入的具体任务。请补充今天最重要的交付物或限制条件。";
         setAiTaskSuggestions([]);
         setAiStatus({
           loading: false,
           error: "",
-          message: result.message || "AI 需要你先补充固定安排、最重要交付物或任务完成标准。",
+          message: [result.message, noNewTaskNote].filter(Boolean).join(" "),
         });
         return;
       }
@@ -3089,23 +3156,7 @@ function App() {
             setScheduleQuestions={setScheduleQuestions}
             addManualBlock={addManualBlock}
             submitBlockForm={submitBlockForm}
-            addBlockDirectly={(data) => {
-              patchPlanner((current) => ({
-                blocks: current.blocks.concat({
-                  id: uid("block"),
-                  taskId: data.type === "busy" ? "" : data.taskId,
-                  title: data.title || (data.type === "busy" ? "固定占用" : ""),
-                  type: data.type,
-                  date: selectedDate,
-                  start: data.start,
-                  end: data.end,
-                  auto: false,
-                }),
-              }));
-              if (data.taskId) {
-                setScheduleQuestions((qs) => qs.filter((q) => q.taskId !== data.taskId));
-              }
-            }}
+            addBlockDirectly={addBlockDirectly}
             deleteBlock={deleteBlock}
             updateBlock={updateBlock}
             aiStatus={aiStatus}
@@ -3270,14 +3321,20 @@ function TodayView({
 
   function fillScheduleQuestion(question) {
     const estimateMinutes = Math.max(10, Number(question.estimateMinutes) || 30);
-    const fixedBlocks = todayBlocks.filter((b) => b.type === "busy" || (!b.taskId && !b.auto));
-    const intervals = getFreeIntervals(planner.settings, fixedBlocks);
+    const intervals = getFreeIntervals(planner.settings, todayBlocks);
     const interval = intervals.find((item) => item.end - item.start >= estimateMinutes);
-    const workStart = (planner.settings.workSegments && planner.settings.workSegments[0]?.start) || planner.settings.workStart || "09:00";
-    const start = interval ? toTime(interval.start) : workStart;
+    if (!interval) {
+      setBlockDraft((draft) => ({ ...draft, type: "task", taskId: question.taskId, title: "" }));
+      return;
+    }
+    const start = toTime(interval.start);
     const end = toTime(toMinutes(start) + estimateMinutes);
-    addBlockDirectly({ type: "task", taskId: question.taskId, title: "", start, end });
-    setScheduleQuestions((qs) => qs.filter((q) => q.id !== question.id));
+    const added = addBlockDirectly({ type: "task", taskId: question.taskId, title: "", start, end });
+    if (added) {
+      setScheduleQuestions((qs) => qs.filter((q) => q.id !== question.id));
+      return;
+    }
+    setBlockDraft((draft) => ({ ...draft, type: "task", taskId: question.taskId, title: "" }));
   }
 
   function cancelEditingTask() {
