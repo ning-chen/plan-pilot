@@ -3925,6 +3925,7 @@ function getConnectedIds(goalId, goals) {
   const stack = childrenMap[goalId] ? [...childrenMap[goalId]] : [];
   while (stack.length) {
     const id = stack.pop();
+    if (connected.has(id)) continue;
     connected.add(id);
     if (childrenMap[id]) stack.push(...childrenMap[id]);
   }
