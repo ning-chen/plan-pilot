@@ -459,7 +459,7 @@ function normalizeCoachItems(items, selectedDate) {
           priority: normalizePriority(item.priority),
           parentId: String(item.parentId || ""),
           parentTitle: String(item.parentTitle || item.parent || "").trim(),
-          tempId: String(item.tempId || item.id || item.key || item.title || "").trim(),
+          tempId: String(item.tempId || item.id || item.key || "").trim(),
         };
       }
 
@@ -488,7 +488,7 @@ function normalizeCoachItems(items, selectedDate) {
         date: inferDateFromText([item.date, item.when, item.horizon, item.scope].filter(Boolean).join(" "), selectedDate),
         goalId: String(item.goalId || ""),
         goalTitle: String(item.goalTitle || item.goal || "").trim(),
-        tempId: String(item.tempId || item.id || item.key || item.title || "").trim(),
+        tempId: String(item.tempId || item.id || item.key || "").trim(),
       };
     })
     .filter((item) => item?.title);
