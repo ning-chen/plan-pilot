@@ -2523,7 +2523,9 @@ function App() {
           ? { ...task, date: tomorrow, status: "open" }
           : task,
       ),
-      blocks: current.blocks.filter((block) => block.date !== selectedDate || taskById[block.taskId]?.status === "done"),
+      blocks: current.blocks.filter(
+        (block) => block.date !== selectedDate || current.tasks.find((t) => t.id === block.taskId)?.status === "done",
+      ),
     }));
     setSelectedDate(tomorrow);
   }
