@@ -24,6 +24,7 @@ import {
 const APP_NAME = "计划引航";
 const APP_SHORT_NAME = "引航";
 const STORAGE_KEY = "personal-planning-coach-v1";
+const AI_KEY_STORAGE_KEY = "plan-pilot-ai-api-key-v1";
 
 const priorityOrder = { high: 3, medium: 2, low: 1 };
 const priorityLabel = { high: "高", medium: "中", low: "低" };
@@ -186,6 +187,7 @@ const defaultState = {
     protocol: "openai-compatible",
     baseUrl: "https://api.deepseek.com",
     model: "deepseek-v4-pro",
+    profileLearningEnabled: false,
   },
   goals: [],
   tasks: [],
@@ -204,6 +206,65 @@ function getLocalDate(date = new Date()) {
   const month = `${date.getMonth() + 1}`.padStart(2, "0");
   const day = `${date.getDate()}`.padStart(2, "0");
   return `${year}-${month}-${day}`;
+}
+
+function readLocalAiKey() {
+  try {
+    return localStorage.getItem(AI_KEY_STORAGE_KEY) || "";
+  } catch {
+    return "";
+  }
+}
+
+function isRecurringDerivedBlock(block) {
+  return Boolean(block?.recurringDerived) || String(block?.id || "").startsWith("rec-");
+}
+
+function expandRecurringBlocks(items, existingBlocks = []) {
+  if (!Array.isArray(items) || items.length === 0) return [];
+  const blocks = [];
+  const today = new Date();
+  const existingKeys = new Set(
+    existingBlocks.map((block) => `${block.date}|${block.start}|${block.taskId || block.title || ""}`),
+  );
+
+  items.forEach((item) => {
+    if (!Number.isInteger(item.dayOfWeek) || item.dayOfWeek < 0 || item.dayOfWeek > 6) return;
+    const cursor = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+    const endDate = item.endDate ? new Date(`${item.endDate}T00:00:00`) : null;
+    const maxDate = new Date(today.getFullYear() + 1, today.getMonth(), today.getDate());
+    const limit = endDate && endDate < maxDate ? endDate : maxDate;
+
+    while (cursor <= limit) {
+      if (cursor.getDay() === item.dayOfWeek) {
+        const date = getLocalDate(cursor);
+        const key = `${date}|${item.start}|${item.taskId || item.title || ""}`;
+        if (!existingKeys.has(key)) {
+          blocks.push({
+            id: `rec-${item.id || ""}-${date}`,
+            recurringId: item.id || "",
+            recurringDerived: true,
+            date,
+            type: "busy",
+            taskId: "",
+            title: item.title || "",
+            start: item.start,
+            end: item.end,
+            auto: false,
+          });
+          existingKeys.add(key);
+        }
+      }
+      cursor.setDate(cursor.getDate() + 1);
+    }
+  });
+
+  return blocks;
+}
+
+function replaceRecurringBlocks(items, blocks = []) {
+  const manualBlocks = blocks.filter((block) => !isRecurringDerivedBlock(block));
+  return manualBlocks.concat(expandRecurringBlocks(items, manualBlocks));
 }
 
 function addDays(dateString, amount) {
@@ -272,7 +333,10 @@ function hydrateState(input) {
       ? input.goals.map((g) => ({ progress: 0, ...g }))
       : [],
     tasks: mergeDuplicateTasks(Array.isArray(input?.tasks) ? input.tasks : []),
-    blocks: Array.isArray(input?.blocks) ? input.blocks : [],
+    blocks: replaceRecurringBlocks(
+      Array.isArray(input?.recurring) ? input.recurring : [],
+      Array.isArray(input?.blocks) ? input.blocks : [],
+    ),
     dayPlans: input?.dayPlans && typeof input.dayPlans === "object" ? input.dayPlans : {},
     reviews: Array.isArray(input?.reviews) ? input.reviews : [],
     recurring: Array.isArray(input?.recurring) ? input.recurring : (defaultState.recurring || []),
@@ -959,6 +1023,7 @@ async function callPlanningAi({ ai, messages, maxTokens = 1800, json = true }) {
       protocol: ai.protocol || "openai-compatible",
       baseUrl: ai.baseUrl,
       model: ai.model,
+      apiKey: ai.apiKey || readLocalAiKey() || undefined,
       messages,
       max_tokens: maxTokens,
       temperature: 0.2,
@@ -1000,7 +1065,11 @@ function usePlannerStore() {
             (Array.isArray(fileData.tasks) && fileData.tasks.length > 0) ||
             (Array.isArray(fileData.blocks) && fileData.blocks.length > 0) ||
             (Array.isArray(fileData.goals) && fileData.goals.length > 0) ||
-            (typeof fileData.dayPlans === "object" && Object.keys(fileData.dayPlans).length > 0);
+            (typeof fileData.dayPlans === "object" && Object.keys(fileData.dayPlans).length > 0) ||
+            (Array.isArray(fileData.reviews) && fileData.reviews.length > 0) ||
+            (Array.isArray(fileData.recurring) && fileData.recurring.length > 0) ||
+            (typeof fileData.settings === "object" && Object.keys(fileData.settings).length > 0) ||
+            (typeof fileData.ai === "object" && Object.keys(fileData.ai).length > 0);
           if (hasContent) {
             const merged = hydrateState(fileData);
             setState(merged);
@@ -1416,7 +1485,8 @@ let _autoScheduling = false;
 
 function App() {
   const [planner, setPlanner] = usePlannerStore();
-  const [aiKeyLoaded, setAiKeyLoaded] = useState(false);
+  const [localAiKey, setLocalAiKey] = useState(readLocalAiKey);
+  const [serverAiKeyLoaded, setServerAiKeyLoaded] = useState(false);
   const [activeView, setActiveView] = useState("today");
   const [selectedDate, setSelectedDate] = useState(getLocalDate());
   const [taskDraft, setTaskDraft] = useState({
@@ -1484,8 +1554,8 @@ function App() {
   useEffect(() => {
     fetch("/api/ai/status")
       .then((r) => r.json())
-      .then((s) => setAiKeyLoaded(!!s.configured))
-      .catch(() => setAiKeyLoaded(false));
+      .then((s) => setServerAiKeyLoaded(!!s.configured))
+      .catch(() => setServerAiKeyLoaded(false));
   }, []);
 
   const dayPlan = planner.dayPlans[selectedDate] || {
@@ -1567,6 +1637,7 @@ function App() {
         ? "先选个目标，拆成更小的下一步。"
         : "今天做得如何？明天要做什么？";
   const currentAiPreset = AI_PROVIDER_PRESETS[planner.ai.provider] || AI_PROVIDER_PRESETS.custom;
+  const aiKeyLoaded = Boolean(localAiKey.trim() || serverAiKeyLoaded);
 
   function patchPlanner(updater) {
     setPlanner((current) => {
@@ -1579,6 +1650,16 @@ function App() {
     patchPlanner((current) => ({
       ai: { ...current.ai, ...patch },
     }));
+  }
+
+  function updateLocalAiKey(value) {
+    setLocalAiKey(value);
+    try {
+      if (value) localStorage.setItem(AI_KEY_STORAGE_KEY, value);
+      else localStorage.removeItem(AI_KEY_STORAGE_KEY);
+    } catch (error) {
+      console.error("AI key localStorage write failed:", error);
+    }
   }
 
   function applyAiProviderPreset(provider) {
@@ -1604,15 +1685,17 @@ function App() {
   }
 
   function addRecurring(item) {
-    patchPlanner((current) => ({
-      recurring: (current.recurring || []).concat(item),
-    }));
+    patchPlanner((current) => {
+      const recurring = (current.recurring || []).concat(item);
+      return { recurring, blocks: replaceRecurringBlocks(recurring, current.blocks) };
+    });
   }
 
   function deleteRecurring(recId) {
-    patchPlanner((current) => ({
-      recurring: (current.recurring || []).filter((r) => r.id !== recId),
-    }));
+    patchPlanner((current) => {
+      const recurring = (current.recurring || []).filter((item) => item.id !== recId);
+      return { recurring, blocks: replaceRecurringBlocks(recurring, current.blocks) };
+    });
   }
 
   function saveMorningPlan() {
@@ -2413,12 +2496,14 @@ function App() {
       return;
     }
     setPlanner(hydrateState(defaultState));
+    updateLocalAiKey("");
     // Immediately persist empty state to server to clear disk files
     fetch("/api/data", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(defaultState),
     }).catch(() => {});
+    fetch("/api/profile", { method: "DELETE" }).catch(() => {});
     setSelectedDate(getLocalDate());
     setTaskDraft({ title: "", estimateMinutes: 60, priority: "medium", goalId: "" });
     setBlockDraft({ type: "task", taskId: "", title: "", start: (defaultState.settings.workSegments[0]?.start || "09:00"), end: "10:00" });
@@ -2490,7 +2575,7 @@ function App() {
     });
 
     // async: update user profile via AI
-    if (planner.ai.enabled) {
+    if (planner.ai.enabled && planner.ai.profileLearningEnabled) {
       updateProfileFromReview(review);
     }
   }
@@ -2749,11 +2834,12 @@ function App() {
                 <button className="primary-action" onClick={() => {
                   if (!recurringDraft.title.trim()) return;
                   const editId = editingRecurringId;
-                  patchPlanner((current) => ({
-                    recurring: (current.recurring || [])
-                      .filter((r) => !editId || r.id !== editId)
-                      .concat({ id: editId || uid("rec"), ...recurringDraft }),
-                  }));
+                  patchPlanner((current) => {
+                    const recurring = (current.recurring || [])
+                      .filter((item) => !editId || item.id !== editId)
+                      .concat({ id: editId || uid("rec"), ...recurringDraft });
+                    return { recurring, blocks: replaceRecurringBlocks(recurring, current.blocks) };
+                  });
                   setRecurringDraft({ title: "", start: "09:00", end: "10:00", dayOfWeek: 1, endDate: "" });
                   setShowRecurringModal(false);
                   setEditingRecurringId(null);
@@ -2784,6 +2870,13 @@ function App() {
           </label>
           <label>
             API Key
+            <input
+              type="password"
+              value={localAiKey}
+              onChange={(event) => updateLocalAiKey(event.target.value)}
+              placeholder={serverAiKeyLoaded ? "已从本机环境变量加载" : "填写你自己的 API Key"}
+              autoComplete="off"
+            />
             <span className={`key-status ${aiKeyLoaded ? "loaded" : "missing"}`}>
               {aiKeyLoaded ? "已加载" : "未配置"}
             </span>
@@ -2805,6 +2898,14 @@ function App() {
                 onChange={(event) => updateAiSettings({ baseUrl: event.target.value })}
                 placeholder={currentAiPreset.baseUrl || "https://api.example.com/v1"}
               />
+            </label>
+            <label className="ai-toggle">
+              <input
+                type="checkbox"
+                checked={Boolean(planner.ai.profileLearningEnabled)}
+                onChange={(event) => updateAiSettings({ profileLearningEnabled: event.target.checked })}
+              />
+              允许 AI 根据复盘更新本地画像
             </label>
           </details>
           <p>
