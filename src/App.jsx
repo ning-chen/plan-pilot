@@ -1336,10 +1336,10 @@ function buildAutoBlocks({ tasks, existingBlocks, settings, selectedDate }) {
         ...task,
         placementReason: ambiguousTicketPurchase
           ? "这像是买票任务，但标题里的时间更可能是车次/出发时间，不是你打算买票的执行时间。"
-          : "看起来是会后整理或后续行动，但我没找到对应会议时间。",
+          : postMeeting ? "看起来是会后整理或后续行动，但我没找到对应会议时间。" : "",
         placementHint: ambiguousTicketPurchase
           ? "请告诉我你准备什么时候买票，或最晚几点前必须买好，再手动放入时间块。"
-          : "请先添加会议的不可用时间块，或手动指定这个任务的开始时间。",
+          : postMeeting ? "请先添加会议的不可用时间块，或手动指定这个任务的开始时间。" : "",
         needsPlacement: (postMeeting && !meetingEnd) || ambiguousTicketPurchase,
         earliestStart: postMeeting && meetingEnd ? meetingEnd : toMinutes((settings.workSegments || [{ start: "09:00" }])[0].start),
       };
