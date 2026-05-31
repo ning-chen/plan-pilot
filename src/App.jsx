@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+﻿import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   CalendarDays,
   CheckCircle2,
@@ -1901,7 +1901,7 @@ function App() {
       const conflictTask = compacted.tasks.find((task) => task.id === conflict.taskId);
       setAiStatus({
         loading: false,
-        error: `这个时间与“${conflictTask?.title || conflict.title || "已有时间块"}”重叠，请先调整。`,
+        error: `这个时间与"${conflictTask?.title || conflict.title || "已有时间块"}"重叠，请先调整。`,
         message: "",
       });
       return;
@@ -1959,7 +1959,7 @@ function App() {
       const conflictTask = planner.tasks.find((task) => task.id === conflict.taskId);
       setAiStatus({
         loading: false,
-        error: `这个时间与“${conflictTask?.title || conflict.title || "已有时间块"}”重叠，请先调整。`,
+        error: `这个时间与"${conflictTask?.title || conflict.title || "已有时间块"}"重叠，请先调整。`,
         message: "",
       });
       return false;
@@ -2364,7 +2364,7 @@ function App() {
     const acceptance = prepareAcceptance(planner);
 
     patchPlanner((current) => {
-      const prepared = current === planner ? acceptance : prepareAcceptance(current);
+      const prepared = prepareAcceptance(current);
       return {
         goals: current.goals.concat(prepared.goals),
         tasks: mergeDuplicateTasks(current.tasks.concat(prepared.tasks)),
@@ -2372,13 +2372,12 @@ function App() {
       };
     });
 
-    const { summary } = acceptance;
     setPlanningCoach((coach) => ({
       ...coach,
       suggestions: [],
       messages: coach.messages.concat({
         role: "assistant",
-        content: `已加入计划：${summary.goals} 个目标、${summary.tasks} 个任务（今日 ${summary.todayTasks} 个，后续 ${summary.futureTasks} 个）、${summary.busy} 个固定安排。后续任务可在“目标”页的后续任务区查看。`,
+        content: `已加入计划：${acceptance.summary.goals} 个目标、${acceptance.summary.tasks} 个任务（今日 ${acceptance.summary.todayTasks} 个，后续 ${acceptance.summary.futureTasks} 个）、${acceptance.summary.busy} 个固定安排。后续任务可在"目标"页的后续任务区查看。`,
       }),
     }));
   }
