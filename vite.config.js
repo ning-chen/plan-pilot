@@ -10,7 +10,7 @@ const DAILY_DIR = path.join(DATA_DIR, "daily");
 const GOALS_MONTHLY_DIR = path.join(DATA_DIR, "goals", "monthly");
 const GOALS_LONGTERM_DIR = path.join(DATA_DIR, "goals", "longterm");
 const RECURRING_FILE = path.join(DATA_DIR, "recurring.json");
-const PROFILE_FILE = path.resolve("user-profile.json");
+const PROFILE_FILE = path.join(DATA_DIR, "user-profile.json");
 
 function ensureDir(dir) {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
