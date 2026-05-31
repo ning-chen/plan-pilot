@@ -2512,7 +2512,9 @@ function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(result),
       });
-    } catch {}
+    } catch (e) {
+      console.error("updateProfileFromReview failed:", e);
+    }
   }
 
   function carryUnfinished() {
