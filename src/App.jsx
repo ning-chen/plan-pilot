@@ -900,20 +900,59 @@ function normalizeSentence(sentence) {
     .trim();
 }
 
+function parseChineseNumber(value) {
+  const text = String(value || "");
+  if (/^\d+$/.test(text)) return Number(text);
+
+  const digits = {
+    零: 0,
+    〇: 0,
+    一: 1,
+    二: 2,
+    两: 2,
+    三: 3,
+    四: 4,
+    五: 5,
+    六: 6,
+    七: 7,
+    八: 8,
+    九: 9,
+  };
+  const tenIndex = text.indexOf("十");
+  if (tenIndex >= 0) {
+    const tens = tenIndex === 0 ? 1 : digits[text.slice(0, tenIndex)];
+    const onesText = text.slice(tenIndex + 1);
+    const ones = onesText ? digits[onesText] : 0;
+    return Number.isInteger(tens) && Number.isInteger(ones) ? tens * 10 + ones : NaN;
+  }
+
+  const parsed = [...text].map((character) => digits[character]);
+  return parsed.length && parsed.every(Number.isInteger) ? Number(parsed.join("")) : NaN;
+}
+
 function parseTimeInSentence(sentence) {
-  const match = sentence.match(/(凌晨|早上|上午|中午|下午|傍晚|晚上)?\s*(\d{1,2})\s*(?:[:：.点时]\s*(\d{1,2})?)?/);
-  if (!match) return null;
+  const matches = String(sentence || "").matchAll(
+    /(凌晨|早上|上午|中午|下午|傍晚|晚上)?\s*(\d{1,2}|[零〇一二两三四五六七八九十]{1,3})\s*([:：.点时])?\s*(半|一刻|三刻)?\s*(\d{1,2}|[零〇一二两三四五六七八九十]{1,3})?\s*(?:分)?/g,
+  );
 
-  const marker = match[1] || "";
-  let hour = Number(match[2]);
-  const minute = Number(match[3] || 0);
+  for (const match of matches) {
+    const marker = match[1] || "";
+    const separator = match[3] || "";
+    let hour = parseChineseNumber(match[2]);
+    let minute = match[5] ? parseChineseNumber(match[5]) : 0;
+    if (match[4] === "半") minute = 30;
+    if (match[4] === "一刻") minute = 15;
+    if (match[4] === "三刻") minute = 45;
 
-  if (!marker && !/[:：.点时]/.test(match[0])) return null;
-  if (hour > 23 || minute > 59) return null;
-  if (/下午|傍晚|晚上/.test(marker) && hour < 12) hour += 12;
-  if (marker === "中午" && hour < 11) hour += 12;
+    if (!marker && !separator) continue;
+    if (!Number.isInteger(hour) || !Number.isInteger(minute) || hour > 23 || minute > 59) continue;
+    if (/下午|傍晚|晚上/.test(marker) && hour < 12) hour += 12;
+    if (marker === "中午" && hour < 11) hour += 12;
 
-  return toTime(hour * 60 + minute);
+    return toTime(hour * 60 + minute);
+  }
+
+  return null;
 }
 
 function extractBusyBlocksFromText(text, date, existingBlocks = []) {
@@ -1389,10 +1428,11 @@ function normalizeAiScheduleResult(result, { tasks, existingBlocks, settings, se
 function preparePlannerForScheduling({ tasks, blocks, settings, selectedDate }) {
   const compacted = compactPlannerTasks(tasks, blocks);
   const protectedBreaks = getProtectedBreaks(settings);
+  const busyBlocks = compacted.blocks.filter((block) => block.date === selectedDate && block.type === "busy");
   const removedTaskIds = [];
   const preparedBlocks = compacted.blocks.filter((block) => {
     if (block.date !== selectedDate || block.auto || block.type === "busy" || !block.taskId) return true;
-    const invalid = !isInsideWorkWindow(block, settings) || overlapsAny(block, protectedBreaks);
+    const invalid = !isInsideWorkWindow(block, settings) || overlapsAny(block, protectedBreaks) || overlapsAny(block, busyBlocks);
     if (invalid) removedTaskIds.push(block.taskId);
     return !invalid;
   });
@@ -1862,13 +1902,18 @@ function App() {
     if (_autoScheduling) return;
     _autoScheduling = true;
     try {
+      const recoveredBusyBlocks = extractBusyBlocksFromText(
+        [dayPlan.fixed, dayPlan.topThree, dayPlan.changes].join("\n"),
+        selectedDate,
+        planner.blocks,
+      );
       const prepared = preparePlannerForScheduling({
       tasks: planner.tasks,
-      blocks: planner.blocks,
+      blocks: planner.blocks.concat(recoveredBusyBlocks),
       settings: planner.settings,
       selectedDate,
     });
-    const removedBreakConflictCount = prepared.removedTaskIds.length;
+    const removedConstraintConflictCount = prepared.removedTaskIds.length;
     patchPlanner({ tasks: prepared.tasks, blocks: prepared.blocks });
     setScheduleQuestions([]);
 
@@ -1935,7 +1980,7 @@ function App() {
         loading: false,
         error: "",
         message: `${schedule.message || "AI 已基于最新任务重新规划；不确定项会显示在下方。"}${
-          removedBreakConflictCount ? ` 已移除 ${removedBreakConflictCount} 个与午休或工作时段冲突的旧手动块。` : ""
+          removedConstraintConflictCount ? ` 已移除 ${removedConstraintConflictCount} 个与固定安排、休息或工作时段冲突的旧任务块。` : ""
         }`,
       });
     } catch (error) {
