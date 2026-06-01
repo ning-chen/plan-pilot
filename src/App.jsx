@@ -20,6 +20,11 @@ import {
   Wand2,
   X,
 } from "lucide-react";
+import {
+  planningCoachStartMessage,
+  planningCoachSystemMessages,
+  TODAY_GUIDE_SYSTEM_PROMPT,
+} from "./planningSkill.js";
 
 const APP_NAME = "计划引航";
 const APP_SHORT_NAME = "引航";
@@ -1013,6 +1018,40 @@ function extractCoachBusyItemsFromText(text, selectedDate, existingBlocks = []) 
   }));
 }
 
+function toBusyBlocks(items) {
+  return items.map((item) => ({
+    id: uid("block"),
+    date: item.date,
+    type: "busy",
+    taskId: "",
+    title: item.title,
+    start: item.start,
+    end: item.end,
+    auto: false,
+  }));
+}
+
+function recoverBusyBlocksFromPlanningContext(text, selectedDate, existingBlocks = []) {
+  return toBusyBlocks(extractCoachBusyItemsFromText(text, selectedDate, existingBlocks));
+}
+
+function mergeUniqueBusyBlocks(existingBlocks, recoveredBlocks) {
+  const merged = [...existingBlocks];
+
+  recoveredBlocks.forEach((candidate) => {
+    const duplicate = merged.some(
+      (block) =>
+        block.type === "busy" &&
+        block.date === candidate.date &&
+        block.start === candidate.start &&
+        titleLooksDuplicate(block.title, candidate.title),
+    );
+    if (!duplicate) merged.push(candidate);
+  });
+
+  return merged;
+}
+
 function extractTimedTasksFromText(text, date, existingTasks = []) {
   const existingKeys = new Set(existingTasks.map(taskIdentity));
 
@@ -1748,6 +1787,23 @@ function App() {
     });
   }
 
+  function syncExplicitBusyBlocks(contextText) {
+    const recoveredBlocks = recoverBusyBlocksFromPlanningContext(contextText, selectedDate, planner.blocks);
+    if (!recoveredBlocks.length) return planner.blocks;
+
+    patchPlanner((current) => ({
+      blocks: mergeUniqueBusyBlocks(
+        current.blocks,
+        recoverBusyBlocksFromPlanningContext(contextText, selectedDate, current.blocks),
+      ),
+    }));
+    return mergeUniqueBusyBlocks(planner.blocks, recoveredBlocks);
+  }
+
+  function currentDayPlanText() {
+    return [dayPlan.fixed, dayPlan.topThree, dayPlan.changes].filter(Boolean).join("\n");
+  }
+
   function updateAiSettings(patch) {
     patchPlanner((current) => ({
       ai: { ...current.ai, ...patch },
@@ -1941,14 +1997,10 @@ function App() {
     if (_autoScheduling) return;
     _autoScheduling = true;
     try {
-      const recoveredBusyBlocks = extractBusyBlocksFromText(
-        [dayPlan.fixed, dayPlan.topThree, dayPlan.changes].join("\n"),
-        selectedDate,
-        planner.blocks,
-      );
+      const blocksWithExplicitCommitments = syncExplicitBusyBlocks(currentDayPlanText());
       const prepared = preparePlannerForScheduling({
       tasks: planner.tasks,
-      blocks: planner.blocks.concat(recoveredBusyBlocks),
+      blocks: blocksWithExplicitCommitments,
       settings: planner.settings,
       selectedDate,
     });
@@ -2319,6 +2371,8 @@ function App() {
       return;
     }
 
+    const blocksWithExplicitCommitments = syncExplicitBusyBlocks(currentDayPlanText());
+    const guideBlocks = sortBlocks(blocksWithExplicitCommitments.filter((block) => block.date === selectedDate));
     setAiTaskSuggestions([]);
     setAiStatus({ loading: true, error: "", message: "AI 正在根据目标、任务和不可用时间生成建议..." });
     try {
@@ -2328,8 +2382,7 @@ function App() {
         messages: [
           {
             role: "system",
-            content:
-              "你是 Plan Pilot 的今日建议助手。基于用户精力、固定安排、目标和已有任务，给出具体可执行的新任务，仅返回 JSON：{\"message\":\"提醒或追问\",\"tasks\":[{\"title\":\"...\",\"estimateMinutes\":45,\"priority\":\"high|medium|low\",\"goalId\":\"可选\",\"reason\":\"为什么\"}]}。约束：只在确实缺少下一步时新增任务，不重复已有任务；如果已有任务已经足够，tasks:[]，message 明确说明无需新增并建议点击自动安排；保护固定时间块；计划不清时 tasks:[] 并用 message 提 1-3 个追问（中文）；复杂设计任务≥180分钟；区分购票执行时间与出行时间，注意打印→扫描→上传等依赖顺序。",
+            content: TODAY_GUIDE_SYSTEM_PROMPT,
           },
           {
             role: "user",
@@ -2339,7 +2392,7 @@ function App() {
               settings: planner.settings,
               activeGoals: activeGoals.map(({ id, title, type, priority, status }) => ({ id, title, type, priority, status })),
               todayTasks: todayTasks.map(({ title, estimateMinutes, priority, status, goalId }) => ({ title, estimateMinutes, priority, status, goalId })),
-              timeBlocks: todayBlocks.map(({ title, taskId, type, start, end, auto }) => ({ title, taskId, type, start, end, auto })),
+              timeBlocks: guideBlocks.map(({ title, taskId, type, start, end, auto }) => ({ title, taskId, type, start, end, auto })),
               previousAiQuestion: followUpAnswer ? aiStatus.message : "",
               followUpAnswer,
             }),
@@ -2412,28 +2465,22 @@ function App() {
       return;
     }
 
+    const userPlanningContext = [
+      currentDayPlanText(),
+      ...nextMessages.filter((message) => message.role === "user").map((message) => message.content),
+    ]
+      .filter(Boolean)
+      .join("\n");
+    const blocksWithExplicitCommitments = syncExplicitBusyBlocks(userPlanningContext);
+    const coachPlanner = { ...planner, blocks: blocksWithExplicitCommitments };
     setPlanningCoach((coach) => ({ ...coach, loading: true, error: "", messages: nextMessages }));
 
     try {
       const result = await callPlanningAi({
         ai: planner.ai,
         maxTokens: 1800,
-        json: false,
         messages: [
-          {
-            role: "system",
-            content:
-              "你是 Plan Pilot 的规划访谈助手。通过提问帮用户梳理今天/本周/月度/长期工作。信息不足时中文提 1 个简洁问题；信息足够时输出 JSON：{\"message\":\"...\",\"done\":false,\"items\":[{\"kind\":\"goal\",\"tempId\":\"g1\",\"type\":\"long|month|week\",\"title\":\"...\",\"priority\":\"high|medium|low\",\"parentId\":\"existing id or tempId\"},{\"kind\":\"task\",\"date\":\"YYYY-MM-DD\",\"title\":\"...\",\"estimateMinutes\":60,\"priority\":\"high|medium|low\",\"goalId\":\"existing id or tempId\"},{\"kind\":\"busy\",\"date\":\"YYYY-MM-DD\",\"title\":\"...\",\"start\":\"HH:MM\",\"end\":\"HH:MM\"}]}。未来任务用绝对日期；无日期定锚的设为周/月/长期目标。不重复已有目标/任务；复杂设计任务估时≥180分钟。",
-          },
-          {
-            role: "system",
-            content:
-              "对话策略：每次回答后判断是否还需追问；不重复用户原文；会议前后分别安排准备和总结任务；用户明确提供且尚未存在于 timeBlocks 的固定安排必须作为 kind=\"busy\" 返回，不能只当作上下文使用。",
-            },
-            {
-              role: "system",
-              content: "长周期访谈构建小层级结构而非扁平任务列表：1 个长期目标 + 1-2 个月度/周目标 + 下步任务，共 4-8 项。已有目标/任务仅作上下文引用不重复。购票任务区分执行时间与出行时间，注意打印→扫描→上传等依赖顺序。",
-            },
+          ...planningCoachSystemMessages(),
           {
             role: "user",
             content: JSON.stringify({
@@ -2449,7 +2496,9 @@ function App() {
                 status,
                 goalId,
               })),
-              timeBlocks: todayBlocks.map(({ title, type, start, end, taskId }) => ({ title, type, start, end, taskId })),
+              timeBlocks: blocksWithExplicitCommitments
+                .filter((block) => block.date === selectedDate)
+                .map(({ title, type, start, end, taskId }) => ({ title, type, start, end, taskId })),
               doNotRepeatTaskTitles: planner.tasks.map((task) => task.title),
               doNotRepeatGoalTitles: planner.goals.map((goal) => goal.title),
             }),
@@ -2461,18 +2510,11 @@ function App() {
         ],
       });
 
-      const userPlanningContext = [
-        dayPlan.fixed,
-        ...nextMessages.filter((message) => message.role === "user").map((message) => message.content),
-      ]
-        .filter(Boolean)
-        .join("\n");
-      const recoveredBusyItems = extractCoachBusyItemsFromText(userPlanningContext, selectedDate, planner.blocks);
       const normalizedItems = attachKnownGoalReferences(
-        normalizeCoachItems(collectCoachItems(result).concat(recoveredBusyItems), selectedDate),
-        planner,
+        normalizeCoachItems(collectCoachItems(result), selectedDate),
+        coachPlanner,
       );
-      const items = filterCoachItems(normalizedItems, planner);
+      const items = filterCoachItems(normalizedItems, coachPlanner);
       setPlanningCoach((coach) => ({
         ...coach,
         loading: false,
@@ -2492,7 +2534,7 @@ function App() {
   function startPlanningCoach() {
     const message = {
       role: "user",
-      content: `请开始一个${planningCoach.scope}规划访谈。先问我一个最关键的问题，然后根据我的回答帮助我新增和拆解任务。`,
+      content: planningCoachStartMessage(planningCoach.scope),
     };
     runPlanningCoach([message]);
   }

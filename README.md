@@ -24,6 +24,7 @@
 - 修复 AI 访谈遗漏固定安排：即使模型没有返回不可用时间块，也会从用户输入和晨间固定安排中识别带时间的会议、监考和出行，并补入日程建议。
 - 增强固定安排保护：支持“下午两点”“三点半”“五点一刻”等中文时间表达；每次自动排程前会重新同步晨间固定安排，并移除与其冲突的旧任务块后重新规划。
 - 修复时间块重叠：重新排程会清理历史冲突块；“今日”快捷放置会避开全部现有任务和固定安排。今日建议没有新增任务时会明确说明原因。
+- 增加内置 Planning Skill Protocol：点击今日建议或开始访谈时会先同步明确固定安排，再调用模型追问或生成任务；访谈每轮统一使用结构化 JSON。
 
 ### 2026-05-30
 
@@ -61,23 +62,78 @@
 - 周期安排：支持录入每周固定时间块，例如组会、课程和长期通勤安排。
 - 数据导入导出：导出 JSON 不包含 API Key。
 - 多模型接入：支持 OpenAI-compatible 和 Anthropic Messages 两类协议。
+- 内置规划协议：统一模型追问、拆解和固定安排落地流程，详见 [Planning Skill Protocol](docs/PLANNING_SKILL.md)。
 
 ## 快速开始
 
-需要安装 Node.js 18 或更高版本。
+第一次运行需要安装 [Node.js](https://nodejs.org/) 18 或更高版本，以及 [Git](https://git-scm.com/)。
+
+### 1. 下载项目
+
+打开终端：
+
+- Windows：打开 PowerShell。
+- macOS / Linux：打开 Terminal。
+
+运行：
+
+```bash
+git clone https://github.com/YangYu-NUAA/plan-pilot.git
+cd plan-pilot
+```
+
+`plan-pilot` 是项目文件夹。它不需要使用中文名称，也不要求放在固定位置。判断是否进入了正确目录的方法是：当前文件夹中应当能看到 `package.json`、`src/` 和 `README.md`。
+
+如果你下载的是 GitHub ZIP 压缩包，请先解压，再进入解压后的项目文件夹。例如：
+
+```powershell
+cd "$HOME\Downloads\plan-pilot-master"
+```
+
+### 2. 安装依赖
+
+确保终端当前位于项目文件夹中，然后运行：
 
 ```bash
 npm install
+```
+
+首次安装通常需要等待一段时间。安装完成后运行：
+
+```bash
 npm run dev
 ```
 
-打开：
+终端出现类似下面的内容后，服务才算启动成功：
 
 ```text
-http://127.0.0.1:5173/
+VITE ready
+Local: http://127.0.0.1:5173/
 ```
 
-生产构建：
+### 3. 打开页面
+
+在浏览器访问：
+
+[http://127.0.0.1:5173/](http://127.0.0.1:5173/)
+
+运行期间不要关闭正在执行 `npm run dev` 的终端窗口。关闭窗口或按 `Ctrl + C` 会停止本地服务，之后再次访问 `127.0.0.1:5173` 就不会显示页面。需要重新使用时，在项目文件夹中再次运行：
+
+```bash
+npm run dev
+```
+
+### 4. 常见问题
+
+- 页面打不开：确认终端中仍然显示 Vite 正在运行，没有回到命令提示符。
+- `npm` 命令不存在：重新安装 Node.js，并关闭后重新打开终端。
+- `5173` 端口被占用：Vite 会自动选择另一个端口，请打开终端中实际显示的 `Local` 地址。
+- 页面显示旧内容：按 `Ctrl + F5` 强制刷新。
+- 完整 AI 功能需要通过本地服务运行；不要直接双击 HTML 文件打开。
+
+### 5. 生产构建
+
+如需检查生产构建，可以运行：
 
 ```bash
 npm run build
@@ -154,14 +210,7 @@ ANTHROPIC_API_KEY=
 
 ## 给别人体验
 
-完整 AI 功能需要本地代理，因此推荐把仓库地址发给体验者，让对方运行：
-
-```bash
-git clone https://github.com/YangYu-NUAA/plan-pilot.git
-cd plan-pilot
-npm install
-npm run dev
-```
+完整 AI 功能需要本地代理，因此推荐把仓库地址发给体验者，让对方按照上方“快速开始”操作。体验者需要填写自己的 API Key。
 
 如果只想体验非 AI 功能，也可以运行：
 
@@ -177,8 +226,11 @@ npm run preview
 ├── public/                 # PWA manifest、图标、service worker
 ├── src/
 │   ├── App.jsx             # 主应用逻辑
+│   ├── planningSkill.js    # 内置规划协议和统一提示词
 │   ├── main.jsx            # React 入口
 │   └── styles.css          # 样式
+├── docs/
+│   └── PLANNING_SKILL.md   # 规划协议说明与 MCP 扩展方向
 ├── data/                   # 本地计划备份和画像，运行后生成，不提交
 ├── vite.config.js          # Vite 配置和本地 AI 代理
 ├── package.json
