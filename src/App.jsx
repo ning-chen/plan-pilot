@@ -464,15 +464,19 @@ function normalizeBreakdownItems(items, goal, selectedDate) {
 
 function normalizeTaskSuggestions(items, selectedDate) {
   return (Array.isArray(items) ? items : [])
-    .map((item) => ({
-      id: uid("suggestion"),
-      title: String(item.title || "").trim(),
-      estimateMinutes: estimateMinutesForTitle(item.title, Math.max(10, Number(item.estimateMinutes) || 45)),
-      priority: normalizePriority(item.priority),
-      date: /^\d{4}-\d{2}-\d{2}$/.test(item.date) ? item.date : selectedDate,
-      goalId: String(item.goalId || ""),
-      reason: String(item.reason || "").trim(),
-    }))
+    .map((item) => {
+      const start = /^\d{2}:\d{2}$/.test(item.start) ? item.start : parseTimeInSentence(item.title || "");
+      return {
+        id: uid("suggestion"),
+        title: String(item.title || "").trim(),
+        estimateMinutes: estimateMinutesForTitle(item.title, Math.max(10, Number(item.estimateMinutes) || 45)),
+        priority: normalizePriority(item.priority),
+        date: /^\d{4}-\d{2}-\d{2}$/.test(item.date) ? item.date : selectedDate,
+        goalId: String(item.goalId || ""),
+        reason: String(item.reason || "").trim(),
+        ...(start ? { fixedTime: true, fixedStart: start } : {}),
+      };
+    })
     .filter((item) => item.title);
 }
 
@@ -603,7 +607,7 @@ function compactPlannerTasks(tasks, blocks) {
   const tasksWithoutBusyCommitments = tasks.filter(
     (task) =>
       !(
-        task.fixedTime &&
+        (task.fixedTime || task.kind === "fixed") &&
         blocks.some(
           (block) =>
             block.type === "busy" &&
@@ -820,6 +824,20 @@ function defaultBusyDuration(sentence) {
   return 60;
 }
 
+// 规则抽取的保守闸门：只把「短、单一、干净」的句子落成任务/时间块。
+// 长自然句、串联多件事、或情绪/元描述（"有点焦虑""其他暂时没有"）一律跳过，交给 LLM 拆解，
+// 避免把用户一整段口语原样复制成一个任务，或从中乱解析出时间块。
+function looksLikeSingleActionItem(sentence) {
+  const s = String(sentence || "").trim();
+  if (!s) return false;
+  if (s.length > 24) return false; // 过长的自然句交给 LLM
+  if (/焦虑|压力|不知道|有点|暂时没有|没有别的|其他.{0,6}没有|很多.{0,8}(事情|要做)|事情要做|担心|纠结|烦|累/.test(s)) return false; // 情绪/元描述
+  if (/(然后|接着|之后|以及|并且|还要|还得|还需|一件事|另外)/.test(s)) return false; // 连接词/多事件信号
+  const times = s.match(/(凌晨|早上|上午|中午|下午|傍晚|晚上)?\s*\d{1,2}\s*[点:：时]/g) || [];
+  if (times.length > 1) return false; // 多个时间点 → 多事件
+  return true;
+}
+
 function isBusySentence(sentence) {
   if (/购买|买票|订票|预订|查票|抢票/.test(sentence)) return false;
   return /会议|开会|开[^，。；;\n]{1,24}会|课题会|组会|例会|研讨会|讨论|探讨|汇报|会谈|监考|考试|上课|答辩|面试|出发|前往|返回|通勤|火车|高铁|航班|去|外出|办事|接人|送|医院|体检|银行|办理|聚餐|午饭|午休|休息|赴|参观|出差|请假/.test(sentence);
@@ -970,7 +988,7 @@ function extractBusyBlocksFromText(text, date, existingBlocks = []) {
   return String(text || "")
     .split(/[\n。；;]/)
     .map(normalizeSentence)
-    .filter((sentence) => sentence && isBusySentence(sentence))
+    .filter((sentence) => sentence && isBusySentence(sentence) && looksLikeSingleActionItem(sentence))
     .map((sentence) => {
       const start = parseTimeInSentence(sentence);
       if (!start) return null;
@@ -1096,17 +1114,22 @@ function extractActionTasksFromText(text, date, existingTasks = []) {
   return String(text || "")
     .split(/[\n。；;]/)
     .map(normalizeSentence)
-    .filter(isMorningActionSentence)
-    .map((sentence) => ({
-      id: uid("task"),
-      title: sentence,
-      estimateMinutes: estimateMinutesForTitle(sentence, 45),
-      priority: "medium",
-      goalId: "",
-      date,
-      status: "open",
-      createdAt: new Date().toISOString(),
-    }))
+    .filter((sentence) => isMorningActionSentence(sentence) && looksLikeSingleActionItem(sentence))
+    .map((sentence) => {
+      // 动作型句子若带明确时钟时间，视为「固定时间任务」，排期时钉到该时间点；否则为浮动任务，填充空档。
+      const start = parseTimeInSentence(sentence);
+      return {
+        id: uid("task"),
+        title: sentence,
+        estimateMinutes: estimateMinutesForTitle(sentence, 45),
+        priority: start ? "high" : "medium",
+        goalId: "",
+        date,
+        status: "open",
+        ...(start ? { fixedTime: true, fixedStart: start } : {}),
+        createdAt: new Date().toISOString(),
+      };
+    })
     .filter((task) => {
       const key = taskIdentity(task);
       if (existingKeys.has(key)) return false;
@@ -1400,7 +1423,9 @@ function normalizeScheduleQuestions(items, taskById) {
 function normalizeAiScheduleResult(result, { tasks, existingBlocks, settings, selectedDate }) {
   const todayBlocks = existingBlocks.filter((block) => block.date === selectedDate);
   const manualBlocks = todayBlocks.filter((block) => !block.auto);
-  const intervals = getFreeIntervals(settings, manualBlocks);
+  // 固定时间任务先钉到指定时间点，作为 AI 浮动排期的硬约束。
+  const pinned = buildFixedTimeBlocks(tasks, settings, manualBlocks, selectedDate);
+  const intervals = getFreeIntervals(settings, manualBlocks.concat(pinned.blocks));
   const adjustmentsByTaskId = new Map(
     (Array.isArray(result?.taskAdjustments) ? result.taskAdjustments : [])
       .filter((item) => item?.taskId)
@@ -1425,7 +1450,7 @@ function normalizeAiScheduleResult(result, { tasks, existingBlocks, settings, se
     const task = taskById[taskId];
     const start = String(item.start || "");
     const requestedEnd = String(item.end || "");
-    if (!task || task.date !== selectedDate || task.status === "done" || task.fixedTime || scheduledTaskIds.has(taskId)) return;
+    if (!task || task.date !== selectedDate || task.status === "done" || task.fixedTime || task.kind === "fixed" || scheduledTaskIds.has(taskId)) return;
     if (isTicketPurchaseTask(task.title) && !parseTimeInSentence(task.title)) return;
     const meetingEnd = isPostMeetingTask(task.title) ? meetingEndForTask(task.title, manualBlocks) : null;
     if (isPostMeetingTask(task.title) && (!meetingEnd || toMinutes(start) < meetingEnd)) return;
@@ -1445,7 +1470,7 @@ function normalizeAiScheduleResult(result, { tasks, existingBlocks, settings, se
     };
 
     if (!isBlockInsideIntervals(block, intervals)) return;
-    if (overlapsAny(block, manualBlocks.concat(autoBlocks))) return;
+    if (overlapsAny(block, manualBlocks.concat(pinned.blocks).concat(autoBlocks))) return;
     autoBlocks.push(block);
     scheduledTaskIds.add(taskId);
   });
@@ -1464,6 +1489,7 @@ function normalizeAiScheduleResult(result, { tasks, existingBlocks, settings, se
       task.date === selectedDate &&
       task.status !== "done" &&
       !task.fixedTime &&
+      task.kind !== "fixed" &&
       !scheduledTaskIds.has(task.id),
   );
 
@@ -1489,6 +1515,18 @@ function normalizeAiScheduleResult(result, { tasks, existingBlocks, settings, se
     });
   });
 
+  pinned.conflicts.forEach((task) => {
+    if (questions.some((question) => question.taskId === task.id)) return;
+    questions.push({
+      id: uid("schedule-question"),
+      taskId: task.id,
+      title: task.title,
+      estimateMinutes: Number(task.estimateMinutes) || 30,
+      reason: `固定时间 ${task.fixedStart} 与已有安排冲突，没能钉到该时间。`,
+      hint: "请调整该任务时间，或先移开冲突的安排。",
+    });
+  });
+
   const reconciled = reconcileScheduleBlocks(
     existingBlocks
       .filter((block) => !(block.date === selectedDate && block.auto))
@@ -1497,8 +1535,9 @@ function normalizeAiScheduleResult(result, { tasks, existingBlocks, settings, se
     selectedDate,
   );
 
+  // 钉好的固定时间块不参与浮动 reconcile（避免被午休/工作时段裁掉），直接保留用户指定的时间。
   return {
-    blocks: reconciled.blocks,
+    blocks: reconciled.blocks.concat(pinned.blocks),
     tasks: adjustedTasks,
     questions,
     message: result?.message || "",
@@ -1516,6 +1555,76 @@ function preparePlannerForScheduling({ tasks, blocks, settings, selectedDate }) 
   };
 }
 
+// 把「固定时间任务」（fixedTime + fixedStart）钉到其指定时间点，作为排期硬约束。
+// 返回钉好的时间块、已钉任务 id 集合，以及因冲突无法钉入的任务（交给上层变成待决问题）。
+function buildFixedTimeBlocks(tasks, settings, fixedBlocks, selectedDate) {
+  const blocks = [];
+  const pinnedTaskIds = new Set();
+  const conflicts = [];
+  tasks
+    .filter(
+      (task) =>
+        task.date === selectedDate &&
+        task.status !== "done" &&
+        task.fixedTime &&
+        /^\d{2}:\d{2}$/.test(task.fixedStart || ""),
+    )
+    .sort((a, b) => toMinutes(a.fixedStart) - toMinutes(b.fixedStart))
+    .forEach((task) => {
+      // 已被手动放置的固定时间任务不再重复钉块。
+      if (fixedBlocks.some((block) => block.taskId === task.id)) {
+        pinnedTaskIds.add(task.id);
+        return;
+      }
+      const estimate = Math.max(10, estimateMinutesForTitle(task.title, Number(task.estimateMinutes) || 30));
+      const start = task.fixedStart;
+      const end = toTime(toMinutes(start) + estimate);
+      const block = {
+        id: uid("block"),
+        taskId: task.id,
+        type: "task",
+        date: selectedDate,
+        title: "",
+        start,
+        end,
+        auto: true,
+        fixedTime: true,
+      };
+      if (overlapsAny(block, fixedBlocks.concat(blocks))) {
+        conflicts.push(task);
+        return;
+      }
+      blocks.push(block);
+      pinnedTaskIds.add(task.id);
+    });
+  return { blocks, pinnedTaskIds, conflicts };
+}
+
+// 为单个任务找一个合理的时间槽（用于「待决问题」里点击「今日」时的放置），
+// 而不是粗暴塞进当天第一个空档：固定时间→其时间点；会后整理→不早于会议结束；其余→跳过午休的首个可用空档。
+function findSlotForTask(task, settings, dayBlocks, selectedDate) {
+  const estimate = Math.max(10, estimateMinutesForTitle(task.title, Number(task.estimateMinutes) || 30));
+  const sameDay = dayBlocks.filter((block) => block.date === selectedDate);
+
+  if (task.fixedTime && /^\d{2}:\d{2}$/.test(task.fixedStart || "")) {
+    const start = task.fixedStart;
+    const end = toTime(toMinutes(start) + estimate);
+    if (!overlapsAny({ start, end }, sameDay)) return { start, end };
+  }
+
+  const earliest = isPostMeetingTask(task.title)
+    ? meetingEndForTask(task.title, sameDay.filter((block) => block.type === "busy"))
+    : null;
+  const intervals = getFreeIntervals(settings, sameDay.concat(getProtectedBreaks(settings)));
+  for (const interval of intervals) {
+    const start = Math.max(interval.start, earliest || interval.start);
+    if (start + estimate <= interval.end) {
+      return { start: toTime(start), end: toTime(start + estimate) };
+    }
+  }
+  return null;
+}
+
 function buildAutoBlocks({ tasks, existingBlocks, settings, selectedDate }) {
   const todayBlocks = existingBlocks.filter((block) => block.date === selectedDate);
   const manualBlocks = todayBlocks.filter((block) => !block.auto);
@@ -1525,11 +1634,15 @@ function buildAutoBlocks({ tasks, existingBlocks, settings, selectedDate }) {
       .filter((block) => block.type === "busy")
       .map((block) => normalizeTitle(block.title)),
   );
+
+  // 先把固定时间任务钉到指定时间点，作为浮动任务排期的硬约束。
+  const pinned = buildFixedTimeBlocks(tasks, settings, manualBlocks, selectedDate);
   const candidates = tasks
     .filter((task) =>
       task.date === selectedDate &&
       task.status !== "done" &&
       !task.fixedTime &&
+      task.kind !== "fixed" &&
       !scheduledTaskIds.has(task.id) &&
       !busyTaskTitles.has(normalizeTitle(task.title))
     )
@@ -1552,7 +1665,7 @@ function buildAutoBlocks({ tasks, existingBlocks, settings, selectedDate }) {
       };
     });
 
-  const intervals = getFreeIntervals(settings, manualBlocks);
+  const intervals = getFreeIntervals(settings, manualBlocks.concat(pinned.blocks));
   const autoBlocks = [];
   const questions = candidates
     .filter((task) => task.needsPlacement)
@@ -1608,6 +1721,17 @@ function buildAutoBlocks({ tasks, existingBlocks, settings, selectedDate }) {
     });
   });
 
+  pinned.conflicts.forEach((task) => {
+    questions.push({
+      id: uid("schedule-question"),
+      taskId: task.id,
+      title: task.title,
+      estimateMinutes: Number(task.estimateMinutes) || 30,
+      reason: `固定时间 ${task.fixedStart} 与已有安排冲突，没能钉到该时间。`,
+      hint: "请调整该任务时间，或先移开冲突的安排。",
+    });
+  });
+
   const reconciled = reconcileScheduleBlocks(
     existingBlocks
       .filter((block) => !(block.date === selectedDate && block.auto))
@@ -1616,8 +1740,9 @@ function buildAutoBlocks({ tasks, existingBlocks, settings, selectedDate }) {
     selectedDate,
   );
 
+  // 钉好的固定时间块不参与上面的浮动 reconcile（避免被午休/工作时段裁掉），直接保留用户指定的时间。
   return {
-    blocks: reconciled.blocks,
+    blocks: reconciled.blocks.concat(pinned.blocks),
     questions,
   };
 }
@@ -1659,6 +1784,10 @@ function App() {
   const [aiStatus, setAiStatus] = useState({ loading: false, error: "", message: "" });
   const [aiTaskSuggestions, setAiTaskSuggestions] = useState([]);
   const [todayAiReply, setTodayAiReply] = useState("");
+  const [todayGuideActive, setTodayGuideActive] = useState(false);
+  const [schedulePreview, setSchedulePreview] = useState(null); // 自动安排的待确认方案（不落盘）
+  const [scheduleUndo, setScheduleUndo] = useState(null); // 应用排期前的快照，供撤销
+  const [scheduleNotice, setScheduleNotice] = useState({ text: "", tone: "" }); // 时间分配面板的就地反馈（成功/被规则拦截的原因）
   const [scheduleQuestions, setScheduleQuestions] = useState([]);
   const [planningCoach, setPlanningCoach] = useState({
     scope: "today",
@@ -1690,6 +1819,10 @@ function App() {
 
   useEffect(() => {
     setScheduleQuestions([]);
+    setTodayGuideActive(false);
+    setSchedulePreview(null);
+    setScheduleUndo(null);
+    setScheduleNotice({ text: "", tone: "" });
   }, [selectedDate]);
 
   useEffect(() => {
@@ -1768,8 +1901,8 @@ function App() {
     };
   }, [planner.goals, planner.blocks, selectedDate]);
 
-  const showAiFollowUp =
-    !aiStatus.loading && Boolean(aiStatus.message) && aiTaskSuggestions.length === 0 && /[?？]|请.*回答|需要你先补充|缺少/.test(aiStatus.message);
+  // 今日建议对话进行中（已生成、且 AI 尚未判定 done）就一直显示回答框，支持「持续引导直到用户说没有更多」。
+  const showAiFollowUp = todayGuideActive && !aiStatus.loading;
 
   const viewHeadline =
     activeView === "today"
@@ -1856,30 +1989,39 @@ function App() {
     });
   }
 
-  function saveMorningPlan() {
-    const fixedText = [dayPlan.fixed, dayPlan.topThree, dayPlan.changes].join("\n");
-    const taskText = [dayPlan.fixed, dayPlan.topThree].join("\n");
-    let addedTaskCount = 0;
-    let addedBlockCount = 0;
+  // 共享的「先落地固定安排」步骤：把 dayPlan 里写明的固定安排逐条落成不可用时间块与任务。
+  // 三个入口（保存 / 今日建议 / 自动安排）都先调用它，再各自继续，从而保证「固定安排一定先生成」。
+  // 既写入状态（patchPlanner），又同步返回结果，供随后的 AI 调用使用最新的 tasks/blocks（绕开 setState 异步）。
+  // 纯计算版：在给定 base 之上算出「落地固定安排后」的 tasks/blocks，不写状态——供自动安排预览复用。
+  function computeFixedPlanCommit(baseTasks, baseBlocks) {
+    // 只从「固定安排 + 今日最重要」抽取；「变化与风险」是风险描述，不落任务，仅随 dayPlan 作为 AI 上下文。
+    const taskText = [dayPlan.fixed, dayPlan.topThree].filter(Boolean).join("\n");
+    const recoveredBusy = recoverBusyBlocksFromPlanningContext(taskText, selectedDate, baseBlocks);
+    const blocksAfter = mergeUniqueBusyBlocks(baseBlocks, recoveredBusy);
+    const fixedTasks = extractFixedTasksFromText(dayPlan.fixed, selectedDate, baseTasks);
+    const actionTasks = extractActionTasksFromText(taskText, selectedDate, baseTasks.concat(fixedTasks));
+    const newTasks = fixedTasks.concat(actionTasks);
+    const tasksAfter = mergeDuplicateTasks(baseTasks.concat(newTasks));
+    return { tasks: tasksAfter, blocks: blocksAfter, addedTaskCount: newTasks.length, addedBlockCount: blocksAfter.length - baseBlocks.length };
+  }
 
-    patchPlanner((current) => {
-      const busyBlocks = extractBusyBlocksFromText(fixedText, selectedDate, current.blocks);
-      const actionTasks = extractActionTasksFromText(taskText, selectedDate, current.tasks);
-      const fixedTasks = extractFixedTasksFromText(dayPlan.fixed, selectedDate, current.tasks);
-      addedTaskCount = actionTasks.length + fixedTasks.length;
-      addedBlockCount = busyBlocks.length;
-      return {
-        dayPlans: {
-          ...current.dayPlans,
-          [selectedDate]: {
-            ...(current.dayPlans[selectedDate] || dayPlan),
-            morningDone: true,
-          },
+  function commitFixedPlanFromDayPlan() {
+    const r = computeFixedPlanCommit(planner.tasks, planner.blocks);
+    if (r.addedTaskCount || r.addedBlockCount) patchPlanner({ tasks: r.tasks, blocks: r.blocks });
+    return r;
+  }
+
+  function saveMorningPlan() {
+    const { addedTaskCount, addedBlockCount } = commitFixedPlanFromDayPlan();
+    patchPlanner((current) => ({
+      dayPlans: {
+        ...current.dayPlans,
+        [selectedDate]: {
+          ...(current.dayPlans[selectedDate] || dayPlan),
+          morningDone: true,
         },
-        blocks: current.blocks.concat(busyBlocks),
-        tasks: mergeDuplicateTasks(current.tasks.concat(actionTasks).concat(fixedTasks)),
-      };
-    });
+      },
+    }));
 
     setAiStatus({
       loading: false,
@@ -1895,7 +2037,8 @@ function App() {
     return String(text || "")
       .split(/[\n。；;]/)
       .map(normalizeSentence)
-      .filter((s) => s && isBusySentence(s) && !isMeetingSentence(s))
+      // 带时间的承诺由 busy 块表示（占用时间轴），不再重复生成一个 kind:fixed 任务；只有无时间的承诺才落任务。
+      .filter((s) => s && isBusySentence(s) && !isMeetingSentence(s) && !parseTimeInSentence(s) && looksLikeSingleActionItem(s))
       .map((s) => {
         const start = parseTimeInSentence(s);
         return {
@@ -1997,18 +2140,20 @@ function App() {
     if (_autoScheduling) return;
     _autoScheduling = true;
     try {
-      const blocksWithExplicitCommitments = syncExplicitBusyBlocks(currentDayPlanText());
+      // 全程「先算后用、确认才落盘」：在当前状态副本上计算，不直接改时间轴；结果存入 schedulePreview，等用户确认。
+      const snapshot = { tasks: planner.tasks, blocks: planner.blocks };
+      const committed = computeFixedPlanCommit(planner.tasks, planner.blocks);
       const prepared = preparePlannerForScheduling({
-      tasks: planner.tasks,
-      blocks: blocksWithExplicitCommitments,
+      tasks: committed.tasks,
+      blocks: committed.blocks,
       settings: planner.settings,
       selectedDate,
     });
     const removedConstraintConflictCount = prepared.removedTaskIds.length;
-    patchPlanner({ tasks: prepared.tasks, blocks: prepared.blocks });
-    setScheduleQuestions([]);
+    setSchedulePreview(null);
+    setScheduleNotice({ text: "", tone: "" });
 
-    if (!planner.ai.enabled) {
+    const buildRulePreview = (note) => {
       const result = buildAutoBlocks({
         tasks: prepared.tasks,
         existingBlocks: prepared.blocks,
@@ -2016,14 +2161,25 @@ function App() {
         selectedDate,
       });
       const polished = polishAiBlocks(result.blocks, planner.settings.workSegments).filter((b) => !b._drop);
-      patchPlanner({ blocks: polished, tasks: result.tasks || prepared.tasks });
-      setScheduleQuestions(result.questions);
+      return {
+        tasks: result.tasks || prepared.tasks,
+        blocks: polished,
+        questions: result.questions,
+        message: note,
+        snapshot,
+        addedTaskCount: committed.addedTaskCount,
+        removedConstraintConflictCount,
+      };
+    };
+
+    if (!planner.ai.enabled) {
+      setSchedulePreview(buildRulePreview("规则排期预览。"));
+      setAiStatus({ loading: false, error: "", message: "已生成排期预览，确认后才会改动你的时间轴。" });
       return;
     }
 
     setAiStatus({ loading: true, error: "", message: "AI 正在为你安排今日时间..." });
     try {
-      const profile = await fetch("/api/profile").then((r) => r.json()).catch(() => ({}));
       const result = await callPlanningAi({
         ai: planner.ai,
         maxTokens: 2000,
@@ -2031,7 +2187,7 @@ function App() {
           {
             role: "system",
             content:
-              "You are a proactive daily time-blocking planner. Return only JSON: {\"message\":\"short scheduling note\",\"taskAdjustments\":[{\"taskId\":\"existing task id\",\"estimateMinutes\":120,\"reason\":\"why the estimate changed\"}],\"blocks\":[{\"taskId\":\"existing task id\",\"start\":\"HH:MM\",\"end\":\"HH:MM\",\"title\":\"optional\"}],\"questions\":[{\"taskId\":\"optional\",\"title\":\"...\",\"reason\":\"why uncertain\",\"hint\":\"what user should decide\"}]}. Use only existing task ids and never invent tasks. Re-plan the day from scratch on every call while respecting manual/fixed blocks as hard constraints. Do not merely place tasks in input order: reason about urgency, cognitive load, context switching, dependencies, deadlines, energy, and realistic duration. Protect lunch 12:00-13:00 by default. Put deep research/design/writing work into coherent focus blocks, light admin work into lower-energy windows, and preserve dependencies: print before scan/upload/submit, scan before upload, outline/framework/core points before drafting, meeting preparation before the meeting, and meeting follow-up after the meeting. If a ticket-buying task does not say when the purchase itself must happen, ask the user instead of confusing the departure time with purchase time. If duration or placement is genuinely uncertain, ask one concise question instead of forcing a block.",
+              "You are a proactive daily time-blocking planner. Return only JSON: {\"message\":\"short scheduling note\",\"taskAdjustments\":[{\"taskId\":\"existing task id\",\"estimateMinutes\":120,\"reason\":\"why the estimate changed\"}],\"blocks\":[{\"taskId\":\"existing task id\",\"start\":\"HH:MM\",\"end\":\"HH:MM\",\"title\":\"optional\"}],\"questions\":[{\"taskId\":\"optional\",\"title\":\"...\",\"reason\":\"why uncertain\",\"hint\":\"what user should decide\"}]}. Use only existing task ids and never invent tasks. Re-plan the day from scratch on every call while respecting manual/fixed blocks and the already-pinned fixedTimeTasks as hard constraints: never output blocks for fixedTimeTasks and never overlap their time ranges; schedule the remaining tasks around them. Do not merely place tasks in input order: reason about urgency, cognitive load, context switching, dependencies, deadlines, energy, and realistic duration. Protect lunch 12:00-13:00 by default. Put deep research/design/writing work into coherent focus blocks, light admin work into lower-energy windows, and preserve dependencies: print before scan/upload/submit, scan before upload, outline/framework/core points before drafting, meeting preparation before the meeting, and meeting follow-up after the meeting. If a ticket-buying task does not say when the purchase itself must happen, ask the user instead of confusing the departure time with purchase time. If duration or placement is genuinely uncertain, ask one concise question instead of forcing a block.",
           },
           {
             role: "user",
@@ -2041,7 +2197,7 @@ function App() {
               dayPlan,
               protectedBreaks: getProtectedBreaks(planner.settings),
               tasks: prepared.tasks
-                .filter((task) => task.date === selectedDate && task.status !== "done" && !task.fixedTime)
+                .filter((task) => task.date === selectedDate && task.status !== "done" && !task.fixedTime && task.kind !== "fixed")
                 .map(({ id, title, estimateMinutes, priority, goalId }) => ({
                   id,
                   title,
@@ -2052,6 +2208,9 @@ function App() {
               manualBlocks: prepared.blocks
                 .filter((block) => block.date === selectedDate && !block.auto)
                 .map(({ title, taskId, type, start, end }) => ({ title, taskId, type, start, end })),
+              fixedTimeTasks: prepared.tasks
+                .filter((task) => task.date === selectedDate && task.status !== "done" && task.fixedTime && task.fixedStart)
+                .map(({ title, fixedStart, estimateMinutes }) => ({ title, start: fixedStart, estimateMinutes })),
               activeGoals: activeGoals.map(({ id, title, type, priority, status }) => ({ id, title, type, priority, status })),
             }),
           },
@@ -2065,34 +2224,52 @@ function App() {
         selectedDate,
       });
       const polished = polishAiBlocks(schedule.blocks, planner.settings.workSegments).filter((b) => !b._drop);
-      patchPlanner({ tasks: schedule.tasks, blocks: polished });
-      setScheduleQuestions(schedule.questions);
-      setAiStatus({
-        loading: false,
-        error: "",
-        message: `${schedule.message || "AI 已基于最新任务重新规划；不确定项会显示在下方。"}${
-          removedConstraintConflictCount ? ` 已移除 ${removedConstraintConflictCount} 个与固定安排、休息或工作时段冲突的旧任务块。` : ""
-        }`,
+      setSchedulePreview({
+        tasks: schedule.tasks,
+        blocks: polished,
+        questions: schedule.questions,
+        message: schedule.message || "AI 已基于最新任务重新规划。",
+        snapshot,
+        addedTaskCount: committed.addedTaskCount,
+        removedConstraintConflictCount,
       });
+      setAiStatus({ loading: false, error: "", message: "已生成 AI 排期预览，确认后才会改动你的时间轴。" });
     } catch (error) {
-      const result = buildAutoBlocks({
-        tasks: prepared.tasks,
-        existingBlocks: prepared.blocks,
-        settings: planner.settings,
-        selectedDate,
-      });
-      const polished = polishAiBlocks(result.blocks, planner.settings.workSegments).filter((b) => !b._drop);
-      patchPlanner({ blocks: polished, tasks: result.tasks || prepared.tasks });
-      setScheduleQuestions(result.questions);
-      setAiStatus({
-        loading: false,
-        error: "",
-        message: `AI 排期失败（${error.message}），已使用规则安排。`,
-      });
+      setSchedulePreview(buildRulePreview(`AI 排期失败（${error.message}），已改用规则排期。`));
+      setAiStatus({ loading: false, error: "", message: "已生成规则排期预览（AI 调用失败），确认后应用。" });
     }
     } finally {
       _autoScheduling = false;
     }
+  }
+
+  function confirmSchedulePreview() {
+    if (!schedulePreview) return;
+    const preview = schedulePreview;
+    patchPlanner({ tasks: preview.tasks, blocks: preview.blocks });
+    setScheduleQuestions(preview.questions || []);
+    setScheduleUndo(preview.snapshot);
+    setSchedulePreview(null);
+    setAiStatus({
+      loading: false,
+      error: "",
+      message: `${preview.message || "已应用排期。"}${
+        preview.removedConstraintConflictCount ? ` 已移除 ${preview.removedConstraintConflictCount} 个与固定安排、休息或工作时段冲突的旧任务块。` : ""
+      } 不满意可点「撤销」。`,
+    });
+  }
+
+  function cancelSchedulePreview() {
+    setSchedulePreview(null);
+    setAiStatus({ loading: false, error: "", message: "已取消，未改动你的时间轴。" });
+  }
+
+  function undoSchedule() {
+    if (!scheduleUndo) return;
+    patchPlanner({ tasks: scheduleUndo.tasks, blocks: scheduleUndo.blocks });
+    setScheduleQuestions([]);
+    setScheduleUndo(null);
+    setAiStatus({ loading: false, error: "", message: "已撤销，恢复到自动安排前的状态。" });
   }
 
   function addManualBlock(event) {
@@ -2132,7 +2309,7 @@ function App() {
     const taskId = String(fieldValue(form, "taskId", blockDraft.taskId || ""));
     const title = String(fieldValue(form, "title", blockDraft.title || "")).trim();
     if (toMinutes(end) <= toMinutes(start)) {
-      setAiStatus({ loading: false, error: "结束时间需要晚于开始时间。", message: "" });
+      setScheduleNotice({ text: "结束时间需要晚于开始时间。", tone: "error" });
       return;
     }
 
@@ -2156,11 +2333,11 @@ function App() {
     };
 
     if (type !== "busy" && !isInsideWorkWindow(nextBlock, planner.settings)) {
-      setAiStatus({ loading: false, error: "任务时间块超出了当前工作时段，请调整时间或先修改工作开始/结束时间。", message: "" });
+      setScheduleNotice({ text: "任务时间块超出了当前工作时段，请调整时间，或先在左侧把工作时段改宽。", tone: "error" });
       return;
     }
     if (type !== "busy" && overlapsAny(nextBlock, getProtectedBreaks(planner.settings))) {
-      setAiStatus({ loading: false, error: "任务时间块与默认午休 12:00-13:00 冲突，请换一个时间。", message: "" });
+      setScheduleNotice({ text: "和默认午休 12:00-13:00 冲突，请换一个时间。", tone: "error" });
       return;
     }
 
@@ -2177,10 +2354,9 @@ function App() {
     );
     if (conflict) {
       const conflictTask = compacted.tasks.find((task) => task.id === conflict.taskId);
-      setAiStatus({
-        loading: false,
-        error: `这个时间与"${conflictTask?.title || conflict.title || "已有时间块"}"重叠，请先调整。`,
-        message: "",
+      setScheduleNotice({
+        text: `这个时间与"${conflictTask?.title || conflict.title || "已有时间块"}"重叠，请把它放到空的时间段。`,
+        tone: "error",
       });
       return;
     }
@@ -2206,7 +2382,7 @@ function App() {
         ),
       );
     }
-    setAiStatus({ loading: false, error: "", message: "已加入手动时间块。再次点击自动安排时，AI 会保留它并重新规划其余任务。" });
+    setScheduleNotice({ text: "已加入手动时间块。再次点「自动安排」时会保留它并重排其余任务。", tone: "info" });
   }
 
   function deleteBlock(blockId) {
@@ -2220,11 +2396,11 @@ function App() {
     if (!existing) return false;
     const nextBlock = { ...existing, ...patch };
     if (nextBlock.type !== "busy" && !isInsideWorkWindow(nextBlock, planner.settings)) {
-      setAiStatus({ loading: false, error: "任务时间块超出了当前工作时段，请调整时间或先修改工作开始/结束时间。", message: "" });
+      setScheduleNotice({ text: "任务时间块超出了当前工作时段，请调整时间，或先在左侧把工作时段改宽。", tone: "error" });
       return false;
     }
     if (nextBlock.type !== "busy" && overlapsAny(nextBlock, getProtectedBreaks(planner.settings))) {
-      setAiStatus({ loading: false, error: "任务时间块与默认午休 12:00-13:00 冲突，请换一个时间。", message: "" });
+      setScheduleNotice({ text: "和默认午休 12:00-13:00 冲突，请换一个时间。", tone: "error" });
       return false;
     }
     const remainingBlocks = planner.blocks.filter(
@@ -2235,10 +2411,9 @@ function App() {
     );
     if (conflict) {
       const conflictTask = planner.tasks.find((task) => task.id === conflict.taskId);
-      setAiStatus({
-        loading: false,
-        error: `这个时间与"${conflictTask?.title || conflict.title || "已有时间块"}"重叠，请先调整。`,
-        message: "",
+      setScheduleNotice({
+        text: `这个时间与"${conflictTask?.title || conflict.title || "已有时间块"}"重叠，请把它放到空的时间段。`,
+        tone: "error",
       });
       return false;
     }
@@ -2247,7 +2422,7 @@ function App() {
         .filter((block) => block.id === blockId || !(block.auto && block.date === nextBlock.date && overlapsAny(nextBlock, [block])))
         .map((block) => (block.id === blockId ? { ...block, ...patch } : block)),
     }));
-    setAiStatus({ loading: false, error: "", message: "时间块已更新。再次点击自动安排时，AI 会据此重新规划其余任务。" });
+    setScheduleNotice({ text: "时间块已更新。再次点「自动安排」时会据此重排其余任务。", tone: "info" });
     return true;
   }
 
@@ -2371,9 +2546,11 @@ function App() {
       return;
     }
 
-    const blocksWithExplicitCommitments = syncExplicitBusyBlocks(currentDayPlanText());
-    const guideBlocks = sortBlocks(blocksWithExplicitCommitments.filter((block) => block.date === selectedDate));
-    setAiTaskSuggestions([]);
+    // 先把固定安排逐条落地（规则兜底），再让模型补充——保证「固定安排一定先生成」，绕开 setState 异步用返回值喂模型。
+    const committed = followUpAnswer ? { tasks: planner.tasks, blocks: planner.blocks, addedTaskCount: 0 } : commitFixedPlanFromDayPlan();
+    const committedTodayTasks = committed.tasks.filter((task) => task.date === selectedDate);
+    const guideBlocks = sortBlocks(committed.blocks.filter((block) => block.date === selectedDate));
+    if (!followUpAnswer) setAiTaskSuggestions([]); // 仅新一轮清空；追问轮累积保留未「加入」的建议
     setAiStatus({ loading: true, error: "", message: "AI 正在根据目标、任务和不可用时间生成建议..." });
     try {
       const result = await callPlanningAi({
@@ -2391,7 +2568,7 @@ function App() {
               dayPlan,
               settings: planner.settings,
               activeGoals: activeGoals.map(({ id, title, type, priority, status }) => ({ id, title, type, priority, status })),
-              todayTasks: todayTasks.map(({ title, estimateMinutes, priority, status, goalId }) => ({ title, estimateMinutes, priority, status, goalId })),
+              todayTasks: committedTodayTasks.map(({ title, estimateMinutes, priority, status, goalId, fixedTime, fixedStart }) => ({ title, estimateMinutes, priority, status, goalId, fixedTime, fixedStart })),
               timeBlocks: guideBlocks.map(({ title, taskId, type, start, end, auto }) => ({ title, taskId, type, start, end, auto })),
               previousAiQuestion: followUpAnswer ? aiStatus.message : "",
               followUpAnswer,
@@ -2399,28 +2576,35 @@ function App() {
           },
         ],
       });
+      const fixedNote = committed.addedTaskCount ? `已根据固定安排自动生成 ${committed.addedTaskCount} 个任务。` : "";
+      // 持续引导：只要模型没判定 done，就保持对话框开启，让用户继续补充或回答引导问题。
+      setTodayGuideActive(result.done !== true);
       const validGoalIds = new Set(activeGoals.map((goal) => goal.id));
       const rawSuggestions = normalizeTaskSuggestions(result.tasks, selectedDate).map((task) => ({
         ...task,
         goalId: validGoalIds.has(task.goalId) ? task.goalId : "",
       }));
-      const suggestions = filterTaskSuggestions(rawSuggestions, planner.tasks);
+      const suggestions = filterTaskSuggestions(rawSuggestions, committed.tasks);
+      // 跨轮累积、绝不在 done/空轮清空——否则会把用户还没点「加入今日任务」的建议清掉。
+      const pendingReminder = aiTaskSuggestions.length ? "下方还有未加入的建议，记得点“加入今日任务”。" : "";
       if (!suggestions.length) {
         const noNewTaskNote = rawSuggestions.length
-          ? "模型给出的任务均已存在，因此没有重复新增。可点击“自动安排”重新分配现有任务。"
-          : todayTasks.length
-            ? "当前没有需要新增的任务。可点击“自动安排”重新分配现有任务。"
-            : "当前没有生成可加入的具体任务。请补充今天最重要的交付物或限制条件。";
-        setAiTaskSuggestions([]);
+          ? "模型补充的任务均已存在，未重复新增。"
+          : committedTodayTasks.length
+            ? "已有任务足够，无需补充。可点击“自动安排”分配现有任务。"
+            : "当前没有可加入的具体任务。请在固定安排或今日重点里补充今天要做的事。";
         setAiStatus({
           loading: false,
           error: "",
-          message: [result.message, noNewTaskNote].filter(Boolean).join(" "),
+          message: [fixedNote, result.message, noNewTaskNote, pendingReminder].filter(Boolean).join(" "),
         });
         return;
       }
-      setAiTaskSuggestions(suggestions);
-      setAiStatus({ loading: false, error: "", message: result.message || "AI 已生成今日建议。" });
+      setAiTaskSuggestions((prev) => {
+        const seen = new Set(prev.map((item) => normalizeTitle(item.title)));
+        return prev.concat(suggestions.filter((item) => !seen.has(normalizeTitle(item.title))));
+      });
+      setAiStatus({ loading: false, error: "", message: [fixedNote, result.message || "AI 已生成今日建议。"].filter(Boolean).join(" ") });
     } catch (error) {
       setAiStatus({ loading: false, error: error.message || "AI 调用失败。", message: "" });
     }
@@ -2447,6 +2631,7 @@ function App() {
             goalId: task.goalId,
             date: task.date,
             status: "open",
+            ...(task.fixedTime && task.fixedStart ? { fixedTime: true, fixedStart: task.fixedStart } : {}),
             createdAt: new Date().toISOString(),
           })),
         ),
@@ -3194,6 +3379,13 @@ function App() {
             deferTaskTo={deferTaskTo}
             deleteTask={deleteTask}
             autoSchedule={autoSchedule}
+            schedulePreview={schedulePreview}
+            scheduleUndo={scheduleUndo}
+            confirmSchedulePreview={confirmSchedulePreview}
+            cancelSchedulePreview={cancelSchedulePreview}
+            undoSchedule={undoSchedule}
+            scheduleNotice={scheduleNotice}
+            setScheduleNotice={setScheduleNotice}
             scheduleQuestions={scheduleQuestions}
             setScheduleQuestions={setScheduleQuestions}
             addManualBlock={addManualBlock}
@@ -3291,6 +3483,13 @@ function TodayView({
   deferTaskTo,
   deleteTask,
   autoSchedule,
+  schedulePreview,
+  scheduleUndo,
+  confirmSchedulePreview,
+  cancelSchedulePreview,
+  undoSchedule,
+  scheduleNotice,
+  setScheduleNotice,
   scheduleQuestions,
   setScheduleQuestions,
   addManualBlock,
@@ -3362,21 +3561,30 @@ function TodayView({
   }
 
   function fillScheduleQuestion(question) {
-    const estimateMinutes = Math.max(10, Number(question.estimateMinutes) || 30);
-    const intervals = getFreeIntervals(planner.settings, todayBlocks);
-    const interval = intervals.find((item) => item.end - item.start >= estimateMinutes);
-    if (!interval) {
+    const task = planner.tasks.find((t) => t.id === question.taskId) || {
+      title: question.title,
+      estimateMinutes: question.estimateMinutes,
+    };
+    const minutes = Math.max(10, Number(task.estimateMinutes) || Number(question.estimateMinutes) || 30);
+    const name = task.title || question.title || "这个任务";
+    // 购票类时间歧义：不自动放置，交给用户在表单里确认买票的执行时间。
+    if (isTicketPurchaseTask(task.title) && !parseTimeInSentence(task.title)) {
       setBlockDraft((draft) => ({ ...draft, type: "task", taskId: question.taskId, title: "" }));
+      setScheduleNotice({ text: `「${name}」标题里的时间更像车次/出发时间。已填好下方表单，请手动选你真正要执行的时间再添加。`, tone: "info" });
       return;
     }
-    const start = toTime(interval.start);
-    const end = toTime(toMinutes(start) + estimateMinutes);
-    const added = addBlockDirectly({ type: "task", taskId: question.taskId, title: "", start, end });
-    if (added) {
+    const slot = findSlotForTask(task, planner.settings, todayBlocks, selectedDate);
+    if (slot && addBlockDirectly({ type: "task", taskId: question.taskId, title: "", start: slot.start, end: slot.end })) {
       setScheduleQuestions((qs) => qs.filter((q) => q.id !== question.id));
+      setScheduleNotice({ text: `已把「${name}」放到 ${slot.start}–${slot.end}。`, tone: "info" });
       return;
     }
+    // 放不下：明确说明原因和可行的下一步，而不是静默地只填个表单。
     setBlockDraft((draft) => ({ ...draft, type: "task", taskId: question.taskId, title: "" }));
+    setScheduleNotice({
+      text: `今天剩余空档放不下「${name}」（需 ${minutes} 分钟连续时间）。可以：① 拆成更小的步骤分别安排；② 点「延期」改到其他日期；③ 先删掉或缩短当天某个时间块腾出连续时间。已填好下方表单，也可手动指定时间。`,
+      tone: "error",
+    });
   }
 
   function cancelEditingTask() {
@@ -3460,12 +3668,12 @@ function TodayView({
             <textarea
               value={todayAiReply}
               onChange={(event) => setTodayAiReply(event.target.value)}
-              placeholder="在这里回答 AI 的追问，例如：会议 15:00 开始；文档完成后需要提交；剩余时间优先推进方案修改。"
+              placeholder="回答 AI 的问题，或继续补充今天想推进的事（也可以是想做但一时难拆解的需求）；没有更多就回复“没有了”结束本轮。"
             />
             <div className="ai-followup-actions">
               <button className="secondary-action" disabled={!todayAiReply.trim()}>
                 <Send size={18} />
-                发送回答并继续生成
+                发送并继续
               </button>
             </div>
           </form>
@@ -3769,11 +3977,69 @@ function TodayView({
           <div>
             <h2>时间分配</h2>
           </div>
-          <button className="secondary-action" onClick={autoSchedule} disabled={aiStatus.loading}>
+          <button className="secondary-action" onClick={autoSchedule} disabled={aiStatus.loading || Boolean(schedulePreview)}>
             <Sparkles size={18} />
-            {aiStatus.loading ? "正在重新规划" : "自动安排"}
+            {aiStatus.loading ? "正在生成预览" : "自动安排"}
           </button>
         </div>
+
+        {scheduleNotice.text && (
+          <div className={`schedule-notice ${scheduleNotice.tone === "error" ? "is-error" : "is-info"}`} role="status">
+            <span>{scheduleNotice.text}</span>
+            <button
+              type="button"
+              className="schedule-notice-close"
+              aria-label="关闭提示"
+              onClick={() => setScheduleNotice({ text: "", tone: "" })}
+            >
+              ×
+            </button>
+          </div>
+        )}
+
+        {schedulePreview && (
+          <div className="schedule-preview">
+            <div className="schedule-preview-head">
+              <strong>排期预览（未应用）</strong>
+              <span>确认后才会改动你的时间轴。</span>
+            </div>
+            <ul className="schedule-preview-list">
+              {[...schedulePreview.blocks]
+                .filter((block) => block.date === selectedDate)
+                .sort((a, b) => toMinutes(a.start) - toMinutes(b.start))
+                .map((block) => {
+                  const previewTask = schedulePreview.tasks.find((task) => task.id === block.taskId);
+                  const name = previewTask?.title || block.title || (block.type === "busy" ? "固定占用" : "任务");
+                  return (
+                    <li key={block.id} className={block.type === "busy" ? "busy" : ""}>
+                      <span className="preview-time">{block.start}–{block.end}</span>
+                      <span className="preview-name">{name}</span>
+                    </li>
+                  );
+                })}
+            </ul>
+            <div className="schedule-preview-meta">
+              {schedulePreview.addedTaskCount ? `新增 ${schedulePreview.addedTaskCount} 个任务 · ` : ""}
+              {schedulePreview.questions?.length ? `${schedulePreview.questions.length} 项需你判断（应用后在下方处理）` : "全部已排入"}
+            </div>
+            <div className="schedule-preview-actions">
+              <button className="primary-action" onClick={confirmSchedulePreview}>
+                <CheckCircle2 size={18} />
+                确认应用
+              </button>
+              <button className="secondary-action" onClick={cancelSchedulePreview}>
+                取消
+              </button>
+            </div>
+          </div>
+        )}
+
+        {scheduleUndo && !schedulePreview && (
+          <div className="schedule-undo">
+            <span>已应用自动安排。</span>
+            <button className="secondary-action" onClick={undoSchedule}>撤销自动安排</button>
+          </div>
+        )}
 
         <form className="block-form" onSubmit={addManualBlock}>
           <select
