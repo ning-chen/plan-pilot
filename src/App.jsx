@@ -25,6 +25,15 @@ import {
   planningCoachSystemMessages,
   TODAY_GUIDE_SYSTEM_PROMPT,
 } from "./planningSkill.js";
+import {
+  normalizeSentence,
+  isBusySentence,
+  isMeetingSentence,
+  isPostMeetingTask,
+  isTicketPurchaseTask,
+  looksLikeSingleActionItem,
+  pinnableTimeForTitle,
+} from "./planningSemantics.js";
 
 const APP_NAME = "计划引航";
 const APP_SHORT_NAME = "引航";
@@ -465,7 +474,8 @@ function normalizeBreakdownItems(items, goal, selectedDate) {
 function normalizeTaskSuggestions(items, selectedDate) {
   return (Array.isArray(items) ? items : [])
     .map((item) => {
-      const start = /^\d{2}:\d{2}$/.test(item.start) ? item.start : parseTimeInSentence(item.title || "");
+      const rawStart = /^\d{2}:\d{2}$/.test(item.start) ? item.start : parseTimeInSentence(item.title || "");
+      const start = pinnableTimeForTitle(item.title, rawStart); // 购票任务不按标题时间钉定
       return {
         id: uid("suggestion"),
         title: String(item.title || "").trim(),
@@ -824,37 +834,7 @@ function defaultBusyDuration(sentence) {
   return 60;
 }
 
-// 规则抽取的保守闸门：只把「短、单一、干净」的句子落成任务/时间块。
-// 长自然句、串联多件事、或情绪/元描述（"有点焦虑""其他暂时没有"）一律跳过，交给 LLM 拆解，
-// 避免把用户一整段口语原样复制成一个任务，或从中乱解析出时间块。
-function looksLikeSingleActionItem(sentence) {
-  const s = String(sentence || "").trim();
-  if (!s) return false;
-  if (s.length > 24) return false; // 过长的自然句交给 LLM
-  if (/焦虑|压力|不知道|有点|暂时没有|没有别的|其他.{0,6}没有|很多.{0,8}(事情|要做)|事情要做|担心|纠结|烦|累/.test(s)) return false; // 情绪/元描述
-  if (/(然后|接着|之后|以及|并且|还要|还得|还需|一件事|另外)/.test(s)) return false; // 连接词/多事件信号
-  const times = s.match(/(凌晨|早上|上午|中午|下午|傍晚|晚上)?\s*\d{1,2}\s*[点:：时]/g) || [];
-  if (times.length > 1) return false; // 多个时间点 → 多事件
-  return true;
-}
-
-function isBusySentence(sentence) {
-  if (/购买|买票|订票|预订|查票|抢票/.test(sentence)) return false;
-  return /会议|开会|开[^，。；;\n]{1,24}会|课题会|组会|例会|研讨会|讨论|探讨|汇报|会谈|监考|考试|上课|答辩|面试|出发|前往|返回|通勤|火车|高铁|航班|去|外出|办事|接人|送|医院|体检|银行|办理|聚餐|午饭|午休|休息|赴|参观|出差|请假/.test(sentence);
-}
-
-function isMeetingSentence(sentence) {
-  if (/购买|买票|订票|预订|查票|抢票/.test(sentence)) return false;
-  return /会议|开会|开[^，。；;\n]{1,24}会|课题会|组会|例会|研讨会|讨论|探讨|汇报|会谈/.test(sentence);
-}
-
-function isPostMeetingTask(title) {
-  return /整理|总结|纪要|复盘|行动项|后续|待办|要点/.test(title) && /会|会议|课题|讨论|探讨|汇报|组会|研讨/.test(title);
-}
-
-function isTicketPurchaseTask(title) {
-  return /购买|买票|订票|预订|查票|抢票/.test(String(title || "")) && /票|火车|高铁|车次|航班/.test(String(title || ""));
-}
+// 句子分类、抽取闸门、购票时间守卫已移至 ./planningSemantics.js（可被 node --test 独立测试）。
 
 function hasSharedPlanningObject(a, b) {
   const left = String(a || "");
@@ -914,13 +894,6 @@ function meetingEndForTask(taskTitle, blocks) {
   const related = meetingBlocks.filter((block) => hasSharedPlanningObject(title, block.title));
 
   return Math.max(...(related.length ? related : meetingBlocks).map((block) => toMinutes(block.end)));
-}
-
-function normalizeSentence(sentence) {
-  return String(sentence || "")
-    .replace(/\s+/g, " ")
-    .replace(/^[，。；;、\s]+|[，。；;、\s]+$/g, "")
-    .trim();
 }
 
 function parseChineseNumber(value) {
@@ -1117,7 +1090,8 @@ function extractActionTasksFromText(text, date, existingTasks = []) {
     .filter((sentence) => isMorningActionSentence(sentence) && looksLikeSingleActionItem(sentence))
     .map((sentence) => {
       // 动作型句子若带明确时钟时间，视为「固定时间任务」，排期时钉到该时间点；否则为浮动任务，填充空档。
-      const start = parseTimeInSentence(sentence);
+      // 购票任务除外：标题里的时间是车次/出发时间，不能据此钉定执行时间（pinnableTimeForTitle 会返回空）。
+      const start = pinnableTimeForTitle(sentence, parseTimeInSentence(sentence));
       return {
         id: uid("task"),
         title: sentence,
@@ -1923,14 +1897,10 @@ function App() {
   function syncExplicitBusyBlocks(contextText) {
     const recoveredBlocks = recoverBusyBlocksFromPlanningContext(contextText, selectedDate, planner.blocks);
     if (!recoveredBlocks.length) return planner.blocks;
-
-    patchPlanner((current) => ({
-      blocks: mergeUniqueBusyBlocks(
-        current.blocks,
-        recoverBusyBlocksFromPlanningContext(contextText, selectedDate, current.blocks),
-      ),
-    }));
-    return mergeUniqueBusyBlocks(planner.blocks, recoveredBlocks);
+    // 落盘与返回使用同一份合并结果，避免「updater 用 current、返回用闭包」两次独立计算导致 AI 拿到旧时间块。
+    const merged = mergeUniqueBusyBlocks(planner.blocks, recoveredBlocks);
+    patchPlanner({ blocks: merged });
+    return merged;
   }
 
   function currentDayPlanText() {
