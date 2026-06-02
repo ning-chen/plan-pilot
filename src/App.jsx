@@ -13,6 +13,7 @@ import {
   RefreshCw,
   SkipForward,
   Send,
+  Settings,
   Sparkles,
   Target,
   Trash2,
@@ -1728,6 +1729,7 @@ function App() {
   const [localAiKey, setLocalAiKey] = useState(readLocalAiKey);
   const [serverAiKeyLoaded, setServerAiKeyLoaded] = useState(false);
   const [activeView, setActiveView] = useState("today");
+  const [settingsOpen, setSettingsOpen] = useState(false); // 设置抽屉开合
   const [selectedDate, setSelectedDate] = useState(getLocalDate());
   const [taskDraft, setTaskDraft] = useState({
     title: "",
@@ -2512,7 +2514,7 @@ function App() {
     const followUpAnswer = typeof extraAnswer === "string" ? extraAnswer.trim() : "";
 
     if (!planner.ai.enabled) {
-      setAiStatus({ loading: false, error: "请先在左侧启用 AI。", message: "" });
+      setAiStatus({ loading: false, error: "请先在设置里启用 AI（点左侧齿轮）。", message: "" });
       return;
     }
 
@@ -2615,7 +2617,7 @@ function App() {
       setPlanningCoach((coach) => ({
         ...coach,
         loading: false,
-        error: "请先在左侧启用 AI。",
+        error: "请先在设置里启用 AI（点左侧齿轮）。",
       }));
       return;
     }
@@ -2978,31 +2980,48 @@ function App() {
 
   return (
     <main className="app-shell">
-      <aside className="sidebar">
-        <div className="brand">
-          <span className="brand-mark">
-            <Sparkles size={20} />
-          </span>
-          <div>
-            <strong>{APP_NAME}</strong>
-            <span>{formatHumanDate(getLocalDate())}</span>
-          </div>
-        </div>
-
-        <nav className="nav">
-          <button className={activeView === "today" ? "active" : ""} onClick={() => setActiveView("today")}>
-            <CalendarDays size={18} />
-            今日
+      <aside className="rail">
+        <span className="brand-mark" title={APP_NAME}>
+          <Sparkles size={20} />
+        </span>
+        <nav className="rail-nav">
+          <button className={activeView === "today" ? "active" : ""} title="今日" aria-label="今日" onClick={() => setActiveView("today")}>
+            <CalendarDays size={20} />
           </button>
-          <button className={activeView === "goals" ? "active" : ""} onClick={() => setActiveView("goals")}>
-            <Target size={18} />
-            目标
+          <button className={activeView === "goals" ? "active" : ""} title="目标" aria-label="目标" onClick={() => setActiveView("goals")}>
+            <Target size={20} />
           </button>
-          <button className={activeView === "review" ? "active" : ""} onClick={() => setActiveView("review")}>
-            <ListChecks size={18} />
-            复盘
+          <button className={activeView === "review" ? "active" : ""} title="复盘" aria-label="复盘" onClick={() => setActiveView("review")}>
+            <ListChecks size={20} />
           </button>
         </nav>
+        <button
+          className={`rail-settings ${settingsOpen ? "active" : ""}`}
+          title="设置"
+          aria-label="设置"
+          onClick={() => setSettingsOpen((open) => !open)}
+        >
+          <Settings size={20} />
+        </button>
+      </aside>
+
+      {settingsOpen && <div className="drawer-overlay" onClick={() => setSettingsOpen(false)} />}
+
+      <aside className={`settings-drawer ${settingsOpen ? "open" : ""}`} aria-hidden={!settingsOpen}>
+        <div className="drawer-head">
+          <div className="brand">
+            <span className="brand-mark">
+              <Sparkles size={18} />
+            </span>
+            <div>
+              <strong>{APP_NAME}</strong>
+              <span>{formatHumanDate(getLocalDate())}</span>
+            </div>
+          </div>
+          <button className="drawer-close" title="关闭" aria-label="关闭设置" onClick={() => setSettingsOpen(false)}>
+            <X size={18} />
+          </button>
+        </div>
 
         <section className="settings-panel">
           <div className="work-segments-label">工作时段</div>
