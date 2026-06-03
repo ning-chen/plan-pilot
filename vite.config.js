@@ -21,7 +21,9 @@ function readJson(filePath) {
     if (fs.existsSync(filePath)) {
       return JSON.parse(fs.readFileSync(filePath, "utf-8"));
     }
-  } catch {}
+  } catch (e) {
+    console.warn("readJson: failed to parse", filePath, e.message || e); // from PR #6 (hrjtju)
+  }
   return null;
 }
 
@@ -79,11 +81,7 @@ function expandRecurring(items, existingBlocks) {
   );
 
   items.forEach((item) => {
-    if (!item.dayOfWeek && item.dayOfWeek !== 0) {
-      console.warn("expandRecurring: skipping item with missing dayOfWeek", item);
-      return;
-    }
-    if (item.dayOfWeek < 0 || item.dayOfWeek > 6) {
+    if (!Number.isInteger(item.dayOfWeek) || item.dayOfWeek < 0 || item.dayOfWeek > 6) {
       console.warn("expandRecurring: skipping item with invalid dayOfWeek", item.dayOfWeek, item);
       return;
     }
@@ -97,7 +95,7 @@ function expandRecurring(items, existingBlocks) {
     while (cursor <= limit) {
       if (cursor.getDay() === item.dayOfWeek) {
         const ds = formatDate(cursor);
-        const key = `${ds}|${item.start}|${item.taskId || item.title}`;
+        const key = `${ds}|${item.start}|${item.taskId || item.title || ""}`;
         if (!existingKeys.has(key)) {
           blocks.push({
             id: `rec-${item.id || ""}-${ds}`,
@@ -259,7 +257,6 @@ function saveAllData(data) {
   }
   allMonthKeys.forEach((mk) => {
     const existing = readJson(path.join(GOALS_MONTHLY_DIR, `${mk}.json`)) || { goals: [] };
-    const existingIds = new Set(existing.goals.map((g) => g.id));
     const updated = existing.goals.filter((g) => {
       // keep if still in data
       return (data.goals || []).some((ng) => ng.id === g.id);
@@ -412,17 +409,20 @@ function openAiBody(payload) {
 async function callOpenAiCompatible(payload, apiKey) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 60_000);
-  const response = await fetch(chatCompletionUrl(payload.baseUrl), {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify(openAiBody(payload)),
-    signal: controller.signal,
-  });
-  clearTimeout(timer);
-  return response;
+  try {
+    const response = await fetch(chatCompletionUrl(payload.baseUrl), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify(openAiBody(payload)),
+      signal: controller.signal,
+    });
+    return response;
+  } finally {
+    clearTimeout(timer); // 保证超时定时器一定清理（fetch 抛错也不残留）—— from PR #6 (hrjtju)
+  }
 }
 
 async function callAnthropic(payload, apiKey) {
@@ -437,55 +437,60 @@ async function callAnthropic(payload, apiKey) {
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 60_000);
-  const upstream = await fetch(anthropicMessagesUrl(payload.baseUrl), {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": apiKey,
-      "anthropic-version": payload.anthropicVersion || "2023-06-01",
-    },
-    body: JSON.stringify(body),
-    signal: controller.signal,
-  });
-  clearTimeout(timer);
-
-  const text = await upstream.text();
-  let output = text;
   try {
-    const data = JSON.parse(text);
-    if (upstream.ok) {
-      output = JSON.stringify({
-        choices: [
-          {
-            message: {
-              role: "assistant",
-              content: (data.content || [])
-                .filter((part) => part.type === "text")
-                .map((part) => part.text)
-                .join("\n"),
-            },
-          },
-        ],
-        raw: data,
-      });
-    } else if (data.error) {
-      output = JSON.stringify({ error: data.error.message || data.error });
-    }
-  } catch {
-    output = text;
-  }
+    const upstream = await fetch(anthropicMessagesUrl(payload.baseUrl), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": payload.anthropicVersion || "2023-06-01",
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
 
-  return {
-    status: upstream.status,
-    headers: upstream.headers,
-    text: async () => output,
-  };
+    const text = await upstream.text();
+    let output = text;
+    try {
+      const data = JSON.parse(text);
+      if (upstream.ok) {
+        output = JSON.stringify({
+          choices: [
+            {
+              message: {
+                role: "assistant",
+                content: (data.content || [])
+                  .filter((part) => part.type === "text")
+                  .map((part) => part.text)
+                  .join("\n"),
+              },
+            },
+          ],
+          raw: data,
+        });
+      } else if (data.error) {
+        output = JSON.stringify({ error: data.error.message || data.error });
+      }
+    } catch {
+      output = text;
+    }
+
+    return {
+      status: upstream.status,
+      headers: upstream.headers,
+      text: async () => output,
+    };
+  } finally {
+    clearTimeout(timer); // from PR #6 (hrjtju)
+  }
 }
 
 function dataProxy() {
   const handler = async (req, res, next) => {
+    // 按 pathname 路由（剥离 query），避免带 ?query 时精确匹配失配 —— from PR #6 (hrjtju)
+    const pathname = new URL(req.url, "http://localhost").pathname;
     // data API routes
-    if (req.url === "/api/data") {
+    if (pathname === "/api/data") {
       if (req.method === "GET") {
         try {
           const data = loadAllData();
@@ -517,7 +522,7 @@ function dataProxy() {
     }
 
     // user profile
-    if (req.url === "/api/profile") {
+    if (pathname === "/api/profile") {
       if (req.method === "GET") {
         try {
           const profile = readJson(PROFILE_FILE) || {};
@@ -561,7 +566,7 @@ function dataProxy() {
     }
 
     // AI status check
-    if (req.url === "/api/ai/status" && req.method === "GET") {
+    if (pathname === "/api/ai/status" && req.method === "GET") {
       const keyOk = !!(process.env.AI_API_KEY || process.env.DEEPSEEK_API_KEY || process.env.ANTHROPIC_API_KEY);
       res.statusCode = 200;
       res.setHeader("Content-Type", "application/json");
@@ -570,7 +575,7 @@ function dataProxy() {
     }
 
     // AI proxy route
-    if (req.url !== "/api/ai/chat" || req.method !== "POST") {
+    if (pathname !== "/api/ai/chat" || req.method !== "POST") {
       next();
       return;
     }

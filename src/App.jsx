@@ -1164,11 +1164,11 @@ function usePlannerStore() {
             (Array.isArray(fileData.tasks) && fileData.tasks.length > 0) ||
             (Array.isArray(fileData.blocks) && fileData.blocks.length > 0) ||
             (Array.isArray(fileData.goals) && fileData.goals.length > 0) ||
-            (typeof fileData.dayPlans === "object" && Object.keys(fileData.dayPlans).length > 0) ||
+            (fileData.dayPlans != null && typeof fileData.dayPlans === "object" && Object.keys(fileData.dayPlans).length > 0) ||
             (Array.isArray(fileData.reviews) && fileData.reviews.length > 0) ||
             (Array.isArray(fileData.recurring) && fileData.recurring.length > 0) ||
-            (typeof fileData.settings === "object" && Object.keys(fileData.settings).length > 0) ||
-            (typeof fileData.ai === "object" && Object.keys(fileData.ai).length > 0);
+            (fileData.settings != null && typeof fileData.settings === "object" && Object.keys(fileData.settings).length > 0) ||
+            (fileData.ai != null && typeof fileData.ai === "object" && Object.keys(fileData.ai).length > 0);
           if (hasContent) {
             const merged = hydrateState(fileData);
             setState(merged);
@@ -1214,6 +1214,7 @@ function usePlannerStore() {
         body: JSON.stringify(state),
       }).catch(() => {});
     }, 2000);
+    return () => clearTimeout(saveTimer.current); // 卸载/重渲染时清理待写定时器 —— from PR #6 (hrjtju)
   }, [state, loaded]);
 
   return [state, setState];
@@ -1722,10 +1723,9 @@ function buildAutoBlocks({ tasks, existingBlocks, settings, selectedDate }) {
   };
 }
 
-let _autoScheduling = false;
-
 function App() {
   const [planner, setPlanner] = usePlannerStore();
+  const autoSchedulingRef = useRef(false); // 防自动安排并发（每实例，替代模块全局）—— from PR #6 (hrjtju)
   const [localAiKey, setLocalAiKey] = useState(readLocalAiKey);
   const [serverAiKeyLoaded, setServerAiKeyLoaded] = useState(false);
   const [activeView, setActiveView] = useState("today");
@@ -2109,8 +2109,8 @@ function App() {
   }
 
   async function autoSchedule() {
-    if (_autoScheduling) return;
-    _autoScheduling = true;
+    if (autoSchedulingRef.current) return;
+    autoSchedulingRef.current = true;
     try {
       // 全程「先算后用、确认才落盘」：在当前状态副本上计算，不直接改时间轴；结果存入 schedulePreview，等用户确认。
       const snapshot = { tasks: planner.tasks, blocks: planner.blocks };
@@ -2211,7 +2211,7 @@ function App() {
       setAiStatus({ loading: false, error: "", message: "已生成规则排期预览（AI 调用失败），确认后应用。" });
     }
     } finally {
-      _autoScheduling = false;
+      autoSchedulingRef.current = false;
     }
   }
 
@@ -4893,6 +4893,40 @@ function EmptyState({ icon, text }) {
       <span>{text}</span>
     </div>
   );
+}
+
+// 渲染崩溃兜底：避免白屏，给出可刷新的提示 —— from PR #6 (hrjtju)
+export class ErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { error: null };
+  }
+  static getDerivedStateFromError(error) {
+    return { error };
+  }
+  componentDidCatch(error, info) {
+    console.error("ErrorBoundary caught:", error, info);
+  }
+  render() {
+    if (this.state.error) {
+      return (
+        <div style={{ padding: 48, textAlign: "center" }}>
+          <h2 style={{ marginBottom: 12 }}>页面出错了</h2>
+          <p style={{ color: "#667085", marginBottom: 16 }}>{this.state.error.message}</p>
+          <button
+            className="primary-action"
+            onClick={() => {
+              this.setState({ error: null });
+              window.location.reload();
+            }}
+          >
+            刷新页面
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
 }
 
 export default App;
