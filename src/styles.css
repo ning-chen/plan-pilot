@@ -32,7 +32,7 @@
   --radius-sm: 10px;
   --shadow-sm: 0 1px 2px rgba(38, 33, 24, 0.04), 0 1px 3px rgba(38, 33, 24, 0.05);
   --shadow-md: 0 6px 20px rgba(38, 33, 24, 0.07);
-  --ring: 0 0 0 3px rgba(192, 94, 62, 0.22);
+  --ring: 0 0 0 3px color-mix(in srgb, var(--accent) 24%, transparent); /* 跟随 accent 自动变色 */
 }
 
 * {
@@ -234,7 +234,7 @@ textarea {
 
 .nav button.active,
 .nav button:hover {
-  background: #2f5148;
+  background: var(--accent);
 }
 
 .settings-panel {
@@ -791,8 +791,8 @@ textarea {
 }
 
 .ai-message {
-  background: #eef8f2;
-  color: #255544;
+  background: var(--accent-soft);
+  color: var(--accent);
 }
 
 .ai-error {
@@ -843,7 +843,7 @@ textarea {
   max-width: 880px;
   border-radius: 8px;
   padding: 12px;
-  background: #f5f0e4;
+  background: var(--surface-2);
 }
 
 .interview-message.user {
@@ -902,14 +902,14 @@ textarea {
 .primary-action {
   border: 0;
   color: #ffffff;
-  background: #c05e3e;
+  background: var(--accent);
   justify-self: start;
 }
 
 .secondary-action {
-  border: 1px solid #2f5148;
-  color: #2a2722;
-  background: #eef8f2;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  background: var(--accent-soft);
 }
 
 .stats-row {
@@ -1248,13 +1248,49 @@ textarea {
 }
 
 /* 注意：.schedule-question div{display:grid}（特异度 0,1,1）比 .defer-picker（0,1,0）更具体，
-   会把 defer-picker 变成 grid 单列。这里用 .schedule-question .defer-picker（0,2,0）压过它。 */
-.schedule-question .defer-picker {
+   会把 defer-picker 变成 grid 单列。这里用 .schedule-question .defer-picker（0,2,0）压过它。
+   逾期区也复用同一套日期+确认/取消布局。 */
+.schedule-question .defer-picker,
+.overdue-item .defer-picker {
   display: grid;
   grid-template-columns: 1fr 1fr; /* 确认 / 取消 两等分 */
   gap: 8px;
   padding-top: 4px;
 }
+
+/* —— 逾期未完成区 —— */
+.overdue-zone {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 12px;
+  padding: 10px;
+  border: 1px solid color-mix(in srgb, var(--danger) 35%, var(--border));
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--danger) 7%, var(--surface));
+}
+.overdue-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--danger);
+  font-size: 12.5px;
+  font-weight: 800;
+}
+.overdue-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+}
+.overdue-main { display: grid; gap: 3px; min-width: 0; }
+.overdue-main strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; }
+.overdue-meta { color: var(--text-muted); font-size: 12px; }
+.overdue-actions { display: flex; gap: 4px; }
+.overdue-item .defer-picker { grid-column: 1 / -1; }
 
 .defer-picker input {
   grid-column: 1 / -1; /* 日期输入独占整行 */
@@ -1287,7 +1323,7 @@ textarea {
 }
 
 .task-item.fixed {
-  border-left: 4px solid #2f6e9c;
+  border-left: 4px solid var(--accent);
   background: #edf4fa;
 }
 
@@ -1326,7 +1362,7 @@ textarea {
   align-items: center;
   padding: 1px 6px;
   border-radius: 3px;
-  background: #1e4d7a;
+  background: var(--accent);
   color: #ffffff;
   font-size: 10px;
   font-weight: 800;
@@ -1434,7 +1470,7 @@ textarea {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  color: #2f6e9c;
+  color: var(--accent);
   font-weight: 700;
 }
 
@@ -1494,7 +1530,7 @@ textarea {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  color: #2f6e9c;
+  color: var(--accent);
   font-size: 12px;
   font-weight: 700;
 }
@@ -1532,7 +1568,7 @@ textarea {
 }
 
 .time-block.tb-fixed {
-  border-left: 4px solid #2f6e9c;
+  border-left: 4px solid var(--accent);
   background: #edf4fa;
 }
 
@@ -1633,7 +1669,7 @@ textarea {
 }
 
 .goal-line.highlighted {
-  stroke: #2f6e9c;
+  stroke: var(--accent);
   stroke-width: 3;
   stroke-dasharray: none;
   stroke-opacity: 0.9;
@@ -1687,7 +1723,7 @@ textarea {
 }
 
 .goal-highlighted {
-  border-color: #2f6e9c !important;
+  border-color: var(--accent) !important;
   box-shadow: 0 0 0 2px rgba(47, 110, 156, 0.25);
   z-index: 2;
 }
@@ -1705,7 +1741,7 @@ textarea {
 }
 
 .goal-card.paused {
-  background: #f5f0e4;
+  background: var(--surface-2);
 }
 
 .goal-card.done {
@@ -1804,7 +1840,7 @@ textarea {
 }
 
 .goal-card-edit:hover {
-  background: #f5f0e4;
+  background: var(--surface-2);
   color: #2a2722;
 }
 
@@ -1876,15 +1912,15 @@ textarea {
   display: flex;
   align-items: center;
   border-radius: 8px;
-  background: #f5f0e4;
+  background: var(--surface-2);
   padding: 0 12px;
 }
 
 .adjustment-callout {
   gap: 8px;
   margin-top: 16px;
-  background: #fff2df;
-  color: #8a4c2b;
+  background: var(--accent-soft);
+  color: var(--accent);
 }
 
 /* —— 视觉精修：层次 / 悬停 / 聚焦态（calm productivity 风格） —— */
@@ -1894,13 +1930,14 @@ textarea {
 }
 
 .primary-action:hover {
-  background: #a9512f;
+  background: var(--accent-hover);
   box-shadow: var(--shadow-sm);
   transform: translateY(-1px);
 }
 
 .secondary-action:hover {
-  background: #e3f1ea;
+  background: var(--accent);
+  color: #ffffff;
   transform: translateY(-1px);
 }
 
@@ -1930,7 +1967,7 @@ input:focus-visible,
 select:focus-visible,
 textarea:focus-visible {
   outline: none;
-  border-color: #2f5148;
+  border-color: var(--accent);
   box-shadow: var(--ring);
 }
 
@@ -2144,7 +2181,7 @@ textarea:focus-visible {
   height: 32px; border: 1px solid #e2e0d6; border-radius: 8px; background: #fff; padding: 0 9px; font-size: 13px;
 }
 .dt-editbar .dt-edit-title { flex: 1; min-width: 120px; }
-.btn-text { border: 0; background: transparent; color: #c05e3e; font-weight: 600; font-size: 13px; padding: 4px 8px; cursor: pointer; }
+.btn-text { border: 0; background: transparent; color: var(--accent); font-weight: 600; font-size: 13px; padding: 4px 8px; cursor: pointer; }
 
 /* 全天 00:00–24:00 较高，容器内部滚动（自动定位到「现在」），避免页面被一根 24 小时长条撑爆 */
 .day-timeline { position: relative; margin-top: 6px; max-height: 68vh; overflow-y: auto; scrollbar-gutter: stable; }
@@ -2244,4 +2281,55 @@ html[data-theme="graphite"] {
   --meet-soft: #f4efe2; --meet-bar: #a98a45; --meet-ink: #5f4d22;
   --busy-soft: #eef0f3; --busy-bar: #9aa1ad; --busy-ink: #4a515e;
   --admin-soft: #eef1f5; --admin-bar: #6b7689; --admin-ink: #3c4554;
+}
+
+/* —— 目标甘特图 —— */
+.goal-gantt-panel { margin-top: 16px; }
+.gantt-hint { color: var(--text-muted); font-size: 12px; font-weight: 400; }
+.gantt { margin-top: 12px; border: 1px solid var(--border); border-radius: 12px; overflow: hidden; background: var(--surface); }
+
+.gantt-axis,
+.gantt-row { display: grid; grid-template-columns: 280px minmax(0, 1fr); }
+
+.gantt-axis { background: var(--surface-2); border-bottom: 1px solid var(--border); }
+.gantt-axis-spacer { border-right: 1px solid var(--border); }
+.gantt-axis-track { position: relative; height: 30px; }
+.gantt-tick { position: absolute; top: 9px; transform: translateX(-50%); font-size: 10.5px; color: var(--faint); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.gantt-axis-today { position: absolute; top: 9px; transform: translateX(-50%); font-size: 10.5px; font-weight: 800; color: var(--accent); white-space: nowrap; }
+
+.gantt-row { border-bottom: 1px solid var(--hair); }
+.gantt-row:last-child { border-bottom: 0; }
+.gantt-row.is-editing { display: block; padding: 14px; background: var(--surface-2); }
+
+.gantt-label { padding: 8px 10px; border-right: 1px solid var(--border); display: grid; gap: 5px; align-content: center; min-width: 0; overflow: hidden; }
+.gantt-label-top { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.gantt-dot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
+.gantt-dot.long { background: var(--accent); }
+.gantt-dot.month { background: var(--pending); }
+.gantt-dot.week { background: var(--faint); }
+.gantt-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13.5px; font-weight: 700; }
+/* 紧凑图标按钮 + 不收缩，防止编辑/删除挤出标签面板 */
+.gantt-label .icon-button { flex-shrink: 0; width: 26px; height: 26px; }
+.gantt-status { flex-shrink: 0; height: 26px; max-width: 64px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); color: var(--text); font-size: 12px; padding: 0 4px; }
+.gantt-label-bot { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.gantt-progress { flex: 1; min-width: 30px; height: 4px; accent-color: var(--accent); }
+.gantt-progress:disabled { cursor: not-allowed; opacity: 0.7; }
+.gantt-pct { flex-shrink: 0; font-size: 11px; color: var(--text-muted); font-variant-numeric: tabular-nums; width: 34px; text-align: right; }
+.gantt-pct.is-auto { color: var(--accent); font-weight: 700; }
+
+.gantt-track { position: relative; min-height: 56px; }
+.gantt-grid { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--hair); }
+.gantt-track-today { position: absolute; top: 0; bottom: 0; width: 2px; background: color-mix(in srgb, var(--accent) 50%, transparent); }
+.gantt-bar { position: absolute; top: 50%; transform: translateY(-50%); height: 24px; min-width: 8px; border-radius: 7px; background: var(--accent-soft); border: 1.5px solid var(--accent); display: flex; align-items: center; overflow: hidden; }
+.gantt-bar.estimated { border-style: dashed; opacity: 0.85; }
+.gantt-bar.priority-high { border-color: var(--danger); }
+.gantt-bar.priority-medium { border-color: var(--pending); }
+.gantt-bar.priority-low { border-color: var(--faint); }
+.gantt-bar.status-done { opacity: 0.6; }
+.gantt-bar-fill { position: absolute; left: 0; top: 0; bottom: 0; background: color-mix(in srgb, var(--accent) 26%, transparent); }
+.gantt-bar-pct { position: relative; padding: 0 7px; font-size: 10.5px; font-weight: 800; color: var(--accent); white-space: nowrap; }
+
+@media (max-width: 720px) {
+  .gantt-axis, .gantt-row { grid-template-columns: 160px minmax(0, 1fr); }
+  .gantt-meta { max-width: 64px; }
 }

@@ -3862,6 +3862,15 @@ function TodayView({
       .slice(0, 2),
     [planner.tasks, selectedDate],
   );
+  // 逾期未完成：早于当前日期、仍未完成的任务（否则它们会从「今日」视图里彻底消失、被遗忘）
+  const overdueTasks = useMemo(() =>
+    planner.tasks
+      .filter((t) => t.date < selectedDate && t.status !== "done")
+      .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : priorityOrder[b.priority] - priorityOrder[a.priority])),
+    [planner.tasks, selectedDate],
+  );
+  const [deferringTaskId, setDeferringTaskId] = useState(null);
+  const [deferTaskDate, setDeferTaskDate] = useState("");
   const [editingTaskId, setEditingTaskId] = useState(null);
   const [editDraft, setEditDraft] = useState({ title: "", estimateMinutes: 60, priority: "medium", goalId: "" });
   const [editingBlockId, setEditingBlockId] = useState(null);
@@ -4184,6 +4193,57 @@ function TodayView({
         </form>
 
         <div className="task-list">
+          {overdueTasks.length > 0 && (
+            <div className="overdue-zone">
+              <div className="overdue-head">
+                <Clock3 size={14} />
+                逾期未完成 · {overdueTasks.length}
+              </div>
+              {overdueTasks.map((task) => (
+                <article className="overdue-item" key={task.id}>
+                  <div className="overdue-main">
+                    <strong>{task.title}</strong>
+                    <span className="overdue-meta">
+                      原定 {formatShortDate(task.date)} · {priorityLabel[task.priority]} · {task.estimateMinutes} 分钟
+                    </span>
+                  </div>
+                  <div className="overdue-actions">
+                    <button className="icon-button solid" title="顺延到今天" onClick={() => deferTaskTo(task.id, selectedDate)}>
+                      <Plus size={16} />
+                    </button>
+                    <button
+                      className="icon-button"
+                      title="改到指定日期"
+                      onClick={() => {
+                        setDeferringTaskId((id) => (id === task.id ? null : task.id));
+                        setDeferTaskDate(addDays(selectedDate, 1));
+                      }}
+                    >
+                      <CalendarDays size={16} />
+                    </button>
+                    <button className="icon-button danger" title="删除任务" onClick={() => deleteTask(task.id)}>
+                      <Trash2 size={16} />
+                    </button>
+                  </div>
+                  {deferringTaskId === task.id && (
+                    <div className="defer-picker">
+                      <input type="date" value={deferTaskDate} onChange={(e) => setDeferTaskDate(e.target.value)} />
+                      <button
+                        className="primary-action"
+                        onClick={() => {
+                          if (deferTaskDate) deferTaskTo(task.id, deferTaskDate);
+                          setDeferringTaskId(null);
+                        }}
+                      >
+                        确认
+                      </button>
+                      <button className="secondary-action" onClick={() => setDeferringTaskId(null)}>取消</button>
+                    </div>
+                  )}
+                </article>
+              ))}
+            </div>
+          )}
           {todayTasks.length === 0 && <EmptyState icon={<Target size={22} />} text="先写下今天的一件具体工作。" />}
           {todayTasks
             .sort((a, b) => priorityOrder[b.priority] - priorityOrder[a.priority])
@@ -4710,107 +4770,125 @@ function GoalsView({
         )}
       </section>
 
-      <GoalGraph
+      <GoalGantt
         goals={goals}
+        tasks={tasks}
         goalById={goalById}
         updateGoal={updateGoal}
         deleteGoal={deleteGoal}
-        goalTypeLabel={goalTypeLabel}
-        TargetIcon={Target}
-        EmptyState={EmptyState}
       />
     </div>
   );
 }
 
-function buildGoalRows(goals) {
+// 两个 YYYY-MM-DD 的天数差（b - a），用 UTC 避免夏令时误差
+function dayDiff(a, b) {
+  const [ay, am, ad] = a.split("-").map(Number);
+  const [by, bm, bd] = b.split("-").map(Number);
+  return Math.round((Date.UTC(by, bm - 1, bd) - Date.UTC(ay, am - 1, ad)) / 86400000);
+}
+
+// 甘特图数据：每个目标的时间跨度（优先取「该目标及其子目标」关联任务的日期范围，无任务则按类型从今天给默认区间），
+// 按层级深度优先排成有序行，并算出整体时间轴范围（左右各留 2 天）。
+function buildGoalGantt(goals, tasks, todayStr) {
   const childrenMap = {};
   goals.forEach((g) => {
-    if (g.parentId) {
-      if (!childrenMap[g.parentId]) childrenMap[g.parentId] = [];
-      childrenMap[g.parentId].push(g);
-    }
+    if (g.parentId) (childrenMap[g.parentId] = childrenMap[g.parentId] || []).push(g);
   });
+  const tasksByGoal = {};
+  tasks.forEach((t) => {
+    if (t.goalId) (tasksByGoal[t.goalId] = tasksByGoal[t.goalId] || []).push(t);
+  });
+  const goalMap = {};
+  goals.forEach((g) => { goalMap[g.id] = g; });
+  const HORIZON = { long: 84, month: 28, week: 7 };
+
+  // 进度联动：有子目标→取子目标进度均值；否则有关联任务→完成数/总数；都没有→用户手填的 goal.progress（可拖）。
+  // auto=true 表示由子项自动汇总，进度条只读、不让用户拖。
+  const progMemo = {};
+  function progressOf(goalId, visiting) {
+    if (progMemo[goalId]) return progMemo[goalId];
+    if (visiting.has(goalId)) return { value: 0, auto: false };
+    visiting.add(goalId);
+    const children = childrenMap[goalId] || [];
+    const gtasks = tasksByGoal[goalId] || [];
+    let info;
+    if (children.length) {
+      const sum = children.reduce((a, c) => a + progressOf(c.id, visiting).value, 0);
+      info = { value: Math.round(sum / children.length), auto: true, kind: "goals", count: children.length };
+    } else if (gtasks.length) {
+      const done = gtasks.filter((t) => t.status === "done").length;
+      info = { value: Math.round((done / gtasks.length) * 100), auto: true, kind: "tasks", count: gtasks.length };
+    } else {
+      info = { value: Math.max(0, Math.min(100, Number(goalMap[goalId] && goalMap[goalId].progress) || 0)), auto: false };
+    }
+    progMemo[goalId] = info;
+    return info;
+  }
+
+  // 跨度：自身关联任务 ∪ 各子目标的跨度（父目标自动包住子目标，长期目标不再空降 84 天）；
+  // 子树里有真实任务→实线(tasks)，否则虚线(type)；都没有→按类型给默认区间。
+  const spanMemo = {};
+  function spanOf(goalId, visiting) {
+    if (spanMemo[goalId]) return spanMemo[goalId];
+    if (visiting.has(goalId)) return null;
+    visiting.add(goalId);
+    const dates = [];
+    (tasksByGoal[goalId] || []).forEach((t) => { if (/^\d{4}-\d{2}-\d{2}$/.test(t.date)) dates.push(t.date); });
+    const childSpans = (childrenMap[goalId] || []).map((c) => spanOf(c.id, visiting)).filter(Boolean);
+    const starts = dates.concat(childSpans.map((s) => s.start));
+    const ends = dates.concat(childSpans.map((s) => s.end));
+    let info;
+    if (starts.length) {
+      let start = starts[0];
+      let end = ends[0];
+      starts.forEach((d) => { if (d < start) start = d; });
+      ends.forEach((d) => { if (d > end) end = d; });
+      const hasTasks = dates.length > 0 || childSpans.some((s) => s.derived === "tasks");
+      info = { start, end, derived: hasTasks ? "tasks" : "type" };
+    } else {
+      const type = (goalMap[goalId] && goalMap[goalId].type) || "month";
+      info = { start: todayStr, end: addDays(todayStr, HORIZON[type] || 28), derived: "type" };
+    }
+    spanMemo[goalId] = info;
+    return info;
+  }
 
   const rows = [];
   const placed = new Set();
-
-  function placeInRow(goal, rowIndex) {
+  function place(goal, depth) {
     if (placed.has(goal.id)) return;
-    while (rows.length <= rowIndex) rows.push({ long: [], month: [], week: [] });
-    rows[rowIndex][goal.type].push(goal);
     placed.add(goal.id);
-    (childrenMap[goal.id] || []).forEach((child) => placeInRow(child, rowIndex));
+    rows.push({ goal, depth, span: spanOf(goal.id, new Set()), prog: progressOf(goal.id, new Set()) });
+    (childrenMap[goal.id] || []).forEach((c) => place(c, depth + 1));
   }
+  goals.filter((g) => g.type === "long" && !g.parentId).forEach((g) => place(g, 0));
+  goals.filter((g) => g.type === "month" && !g.parentId).forEach((g) => place(g, 0));
+  goals.filter((g) => g.type === "week" && !g.parentId).forEach((g) => place(g, 0));
+  goals.forEach((g) => { if (!placed.has(g.id)) place(g, 0); });
 
-  // place long roots first — each root starts a new row group
-  const longRoots = goals.filter((g) => g.type === "long" && !g.parentId);
-  longRoots.forEach((root, i) => placeInRow(root, i));
-
-  // place remaining unplaced goals in new rows
-  goals.forEach((g) => {
-    if (!placed.has(g.id)) {
-      placeInRow(g, rows.length);
-    }
+  let min = null;
+  let max = null;
+  rows.forEach((r) => {
+    if (min === null || r.span.start < min) min = r.span.start;
+    if (max === null || r.span.end > max) max = r.span.end;
   });
-
-  return rows;
+  if (min === null) { min = todayStr; max = addDays(todayStr, 28); }
+  return { rows, min: addDays(min, -2), max: addDays(max, 2) };
 }
 
-function getConnectedIds(goalId, goals) {
-  const parentMap = {};
-  const childrenMap = {};
-  goals.forEach((g) => {
-    parentMap[g.id] = g.parentId;
-    if (g.parentId) {
-      if (!childrenMap[g.parentId]) childrenMap[g.parentId] = [];
-      childrenMap[g.parentId].push(g.id);
-    }
-  });
-
-  const connected = new Set([goalId]);
-
-  // walk up
-  let cursor = goalId;
-  while (parentMap[cursor]) {
-    connected.add(parentMap[cursor]);
-    cursor = parentMap[cursor];
-  }
-
-  // walk down
-  const stack = childrenMap[goalId] ? [...childrenMap[goalId]] : [];
-  while (stack.length) {
-    const id = stack.pop();
-    if (connected.has(id)) continue;
-    connected.add(id);
-    if (childrenMap[id]) stack.push(...childrenMap[id]);
-  }
-
-  return connected;
-}
-
-function GoalGraph({ goals, goalById, updateGoal, deleteGoal, goalTypeLabel, TargetIcon, EmptyState }) {
-  const graphRef = useRef(null);
-  const goalRefs = useRef(new Map());
-  const [hoveredGoalId, setHoveredGoalId] = useState(null);
-  const [lines, setLines] = useState([]);
+function GoalGantt({ goals, tasks, goalById, updateGoal, deleteGoal }) {
   const [editingGoalId, setEditingGoalId] = useState(null);
-  const [editDraft, setEditDraft] = useState({ title: "", priority: "medium", parentId: "" });
+  const [editDraft, setEditDraft] = useState({ title: "", type: "long", priority: "medium", parentId: "" });
+  const today = getLocalDate();
 
   function startEditingGoal(goal) {
     setEditingGoalId(goal.id);
-    setEditDraft({
-      title: goal.title,
-      type: goal.type,
-      priority: goal.priority,
-      parentId: goal.parentId || "",
-    });
+    setEditDraft({ title: goal.title, type: goal.type, priority: goal.priority, parentId: goal.parentId || "" });
   }
-
   function cancelEditingGoal() {
     setEditingGoalId(null);
   }
-
   function saveEditingGoal(goalId) {
     if (!editDraft.title.trim()) return;
     updateGoal(goalId, {
@@ -4821,263 +4899,167 @@ function GoalGraph({ goals, goalById, updateGoal, deleteGoal, goalTypeLabel, Tar
     });
     setEditingGoalId(null);
   }
-
-  function handleStatusChange(goal, newStatus) {
-    if (newStatus === "done") {
-      updateGoal(goal.id, { status: "done", progress: 100 });
-    } else {
-      updateGoal(goal.id, { status: newStatus });
-    }
+  function handleStatusChange(goal, status) {
+    if (status === "done") updateGoal(goal.id, { status: "done", progress: 100 });
+    else updateGoal(goal.id, { status });
   }
-
   function handleProgressChange(goal, value) {
     const progress = Number(value);
-    if (progress >= 100) {
-      updateGoal(goal.id, { progress: 100, status: "done" });
-    } else {
-      updateGoal(goal.id, { progress });
-    }
+    if (progress >= 100) updateGoal(goal.id, { progress: 100, status: "done" });
+    else updateGoal(goal.id, { progress });
   }
 
-  const rows = useMemo(() => buildGoalRows(goals), [goals]);
+  const { rows, min, max } = useMemo(() => buildGoalGantt(goals, tasks, today), [goals, tasks, today]);
+  const totalDays = Math.max(1, dayDiff(min, max));
+  const pct = (date) => Math.max(0, Math.min(100, (dayDiff(min, date) / totalDays) * 100));
+  const ticks = [];
+  for (let d = min; d <= max; d = addDays(d, 7)) ticks.push(d);
+  const showToday = today >= min && today <= max;
 
-  const connectedIds = useMemo(
-    () => (hoveredGoalId ? getConnectedIds(hoveredGoalId, goals) : new Set()),
-    [hoveredGoalId, goals],
-  );
-
-  const computeLines = useCallback(() => {
-    if (!graphRef.current) return;
-    const containerRect = graphRef.current.getBoundingClientRect();
-    const newLines = [];
-
-    goals.forEach((goal) => {
-      if (!goal.parentId) return;
-      const parentEl = goalRefs.current.get(goal.parentId);
-      const childEl = goalRefs.current.get(goal.id);
-      if (!parentEl || !childEl) return;
-
-      const pr = parentEl.getBoundingClientRect();
-      const cr = childEl.getBoundingClientRect();
-
-      const x1 = pr.right - containerRect.left;
-      const y1 = pr.top + pr.height / 2 - containerRect.top;
-      const x2 = cr.left - containerRect.left;
-      const y2 = cr.top + cr.height / 2 - containerRect.top;
-
-      const cx = (x1 + x2) / 2;
-      newLines.push({
-        key: `${goal.parentId}-${goal.id}`,
-        parentId: goal.parentId,
-        childId: goal.id,
-        d: `M${x1},${y1} C${cx},${y1} ${cx},${y2} ${x2},${y2}`,
-      });
-    });
-
-    setLines(newLines);
-  }, [goals]);
-
-  useEffect(() => {
-    computeLines();
-    const onResize = () => computeLines();
-    window.addEventListener("resize", onResize);
-    return () => window.removeEventListener("resize", onResize);
-  }, [computeLines]);
-
-  const setGoalRef = useCallback((goalId, el) => {
-    if (el) {
-      goalRefs.current.set(goalId, el);
-    } else {
-      goalRefs.current.delete(goalId);
-    }
-  }, []);
-
-  // re-run line computation after refs are attached
-  useEffect(() => {
-    computeLines();
-  }, [goals, computeLines]);
-
-  const allPlaced = goals.length > 0 && rows.some((row) => row.long.length + row.month.length + row.week.length > 0);
+  if (!goals.length) {
+    return (
+      <section className="panel goal-gantt-panel">
+        <div className="section-heading">
+          <h2>目标甘特图</h2>
+        </div>
+        <EmptyState icon={<Target size={22} />} text="还没有目标。在上方新增长期 / 月度 / 本周目标后，这里会按时间线展示。" />
+      </section>
+    );
+  }
 
   return (
-    <div className="goal-graph" ref={graphRef}>
-      <svg className="goal-lines">
-        {lines.map((line) => {
-          const isHovered =
-            hoveredGoalId && (connectedIds.has(line.parentId) || connectedIds.has(line.childId));
-          return (
-            <path
-              key={line.key}
-              d={line.d}
-              className={`goal-line${isHovered ? " highlighted" : ""}`}
-            />
-          );
-        })}
-      </svg>
-
-      <div className="goal-graph-columns">
-        {["long", "month", "week"].map((type) => (
-          <div className="goal-graph-col" key={type}>
-            <div className="goal-graph-col-header">
-              <span>{goalTypeLabel[type]}</span>
-              <strong>{goals.filter((g) => g.type === type).length}</strong>
-            </div>
-          </div>
-        ))}
+    <section className="panel goal-gantt-panel">
+      <div className="section-heading">
+        <h2>目标甘特图</h2>
+        <span className="gantt-hint">跨度按关联任务的日期范围；无任务的目标按类型给默认区间（虚线条）</span>
       </div>
-
-      <div className="goal-graph-rows">
-        {allPlaced ? (
-          rows.map((row, ri) => (
-            <div className="goal-graph-row" key={ri}>
-              {["long", "month", "week"].map((type) => (
-                <div className="goal-graph-cell" key={type}>
-                  {row[type].map((goal) => {
-                    const isConnected = hoveredGoalId && connectedIds.has(goal.id);
-                    const isDimmed = hoveredGoalId && !isConnected;
-                    const isEditing = editingGoalId === goal.id;
-                    const progress = Number(goal.progress) || 0;
-
-                    if (isEditing) {
-                      return (
-                        <article className="goal-card editing" key={goal.id}>
-                          <div className="goal-edit-form">
-                            <input
-                              value={editDraft.title}
-                              onChange={(e) => setEditDraft((d) => ({ ...d, title: e.target.value }))}
-                              placeholder="目标标题"
-                            />
-                            <div className="goal-edit-row">
-                              <select
-                                value={editDraft.type}
-                                onChange={(e) => setEditDraft((d) => ({ ...d, type: e.target.value, parentId: "" }))}
-                              >
-                                <option value="long">长期</option>
-                                <option value="month">月度</option>
-                                <option value="week">本周</option>
-                              </select>
-                              <select
-                                value={editDraft.priority}
-                                onChange={(e) => setEditDraft((d) => ({ ...d, priority: e.target.value }))}
-                              >
-                                <option value="high">高优先级</option>
-                                <option value="medium">中优先级</option>
-                                <option value="low">低优先级</option>
-                              </select>
-                            </div>
-                            <div className="goal-edit-row">
-                              <select
-                                value={editDraft.parentId}
-                                onChange={(e) => setEditDraft((d) => ({ ...d, parentId: e.target.value }))}
-                              >
-                                <option value="">无上级目标</option>
-                                {goals
-                                  .filter((g) => {
-                                    if (editDraft.type === "month") return g.type === "long";
-                                    if (editDraft.type === "week") return g.type === "month";
-                                    return false;
-                                  })
-                                  .map((g) => (
-                                    <option key={g.id} value={g.id}>
-                                      {g.title}
-                                    </option>
-                                  ))}
-                              </select>
-                            </div>
-                            <div className="goal-edit-actions">
-                              <button className="secondary-action" onClick={() => saveEditingGoal(goal.id)}>
-                                保存
-                              </button>
-                              <button className="secondary-action" onClick={cancelEditingGoal}>取消</button>
-                            </div>
-                          </div>
-                        </article>
-                      );
-                    }
-
-                    const parentGoal = goal.parentId && goalById[goal.parentId];
-                    return (
-                      <article
-                        className={`goal-card ${goal.status} priority-${goal.priority}${
-                          isConnected ? " goal-highlighted" : ""
-                        }${isDimmed ? " goal-dimmed" : ""}`}
-                        key={goal.id}
-                        ref={(el) => setGoalRef(goal.id, el)}
-                        onMouseEnter={() => setHoveredGoalId(goal.id)}
-                        onMouseLeave={() => setHoveredGoalId(null)}
-                      >
-                        <div className="goal-card-header">
-                          <strong className="goal-card-title">{goal.title}</strong>
-                          <select
-                            className="goal-status-select"
-                            value={goal.status}
-                            onChange={(e) => handleStatusChange(goal, e.target.value)}
-                            onClick={(e) => e.stopPropagation()}
-                          >
-                            <option value="active">进行</option>
-                            <option value="paused">暂停</option>
-                            <option value="done">完成</option>
-                          </select>
-                          <button
-                            className="goal-card-delete"
-                            title="删除目标"
-                            onClick={(e) => { e.stopPropagation(); deleteGoal(goal.id); }}
-                          >
-                            <Trash2 size={14} />
-                          </button>
-                        </div>
-                        <div className="goal-card-progress-row">
-                          <div className={`goal-progress ${goal.status}`}>
-                            <input
-                              type="range"
-                              min="0"
-                              max="100"
-                              value={progress}
-                              disabled={goal.status === "done"}
-                              style={{
-                                background:
-                                  goal.status === "done"
-                                    ? "#2f7d55"
-                                    : goal.status === "paused"
-                                      ? `linear-gradient(to right, #d99f1a 0%, #d99f1a ${progress}%, #e9eceb ${progress}%)`
-                                      : `linear-gradient(to right, #2f7d55 0%, #2f7d55 ${progress}%, #e9eceb ${progress}%)`,
-                              }}
-                              onChange={(e) => handleProgressChange(goal, e.target.value)}
-                              onClick={(e) => e.stopPropagation()}
-                            />
-                          </div>
-                          <button
-                            className="goal-card-edit"
-                            title="编辑目标"
-                            onClick={(e) => { e.stopPropagation(); startEditingGoal(goal); }}
-                          >
-                            <Pencil size={15} />
-                          </button>
-                        </div>
-                        {parentGoal && (
-                          <span className="parent-goal">
-                            <TargetIcon size={12} />
-                            {parentGoal.title}
-                          </span>
-                        )}
-                      </article>
-                    );
-                  })}
-                </div>
-              ))}
-            </div>
-          ))
-        ) : (
-          <div className="goal-graph-row">
-            {["long", "month", "week"].map((type) => (
-              <div className="goal-graph-cell" key={type}>
-                <EmptyState icon={<TargetIcon size={22} />} text={`还没有${goalTypeLabel[type]}目标。`} />
-              </div>
+      <div className="gantt">
+        <div className="gantt-axis">
+          <div className="gantt-axis-spacer" />
+          <div className="gantt-axis-track">
+            {ticks.map((d) => (
+              <span key={d} className="gantt-tick" style={{ left: `${pct(d)}%` }}>
+                {formatShortDate(d)}
+              </span>
             ))}
+            {showToday && (
+              <span className="gantt-axis-today" style={{ left: `${pct(today)}%` }}>今天</span>
+            )}
           </div>
-        )}
+        </div>
+        <div className="gantt-rows">
+          {rows.map(({ goal, depth, span, prog }) => {
+            const progress = prog.value;
+            const progressLocked = prog.auto || goal.status === "done";
+            if (editingGoalId === goal.id) {
+              return (
+                <div className="gantt-row is-editing" key={goal.id}>
+                  <div className="goal-edit-form">
+                    <input
+                      value={editDraft.title}
+                      onChange={(e) => setEditDraft((d) => ({ ...d, title: e.target.value }))}
+                      placeholder="目标标题"
+                    />
+                    <div className="goal-edit-row">
+                      <select
+                        value={editDraft.type}
+                        onChange={(e) => setEditDraft((d) => ({ ...d, type: e.target.value, parentId: "" }))}
+                      >
+                        <option value="long">长期</option>
+                        <option value="month">月度</option>
+                        <option value="week">本周</option>
+                      </select>
+                      <select
+                        value={editDraft.priority}
+                        onChange={(e) => setEditDraft((d) => ({ ...d, priority: e.target.value }))}
+                      >
+                        <option value="high">高优先级</option>
+                        <option value="medium">中优先级</option>
+                        <option value="low">低优先级</option>
+                      </select>
+                    </div>
+                    <div className="goal-edit-row">
+                      <select
+                        value={editDraft.parentId}
+                        onChange={(e) => setEditDraft((d) => ({ ...d, parentId: e.target.value }))}
+                      >
+                        <option value="">无上级目标</option>
+                        {goals
+                          .filter((g) => (editDraft.type === "month" ? g.type === "long" : editDraft.type === "week" ? g.type === "month" : false))
+                          .map((g) => (
+                            <option key={g.id} value={g.id}>
+                              {g.title}
+                            </option>
+                          ))}
+                      </select>
+                    </div>
+                    <div className="goal-edit-actions">
+                      <button className="secondary-action" onClick={() => saveEditingGoal(goal.id)}>保存</button>
+                      <button className="secondary-action" onClick={cancelEditingGoal}>取消</button>
+                    </div>
+                  </div>
+                </div>
+              );
+            }
+            const left = pct(span.start);
+            const width = Math.max(2.5, ((dayDiff(span.start, span.end) + 1) / totalDays) * 100);
+            return (
+              <div className="gantt-row" key={goal.id}>
+                <div className="gantt-label" style={{ paddingLeft: 10 + depth * 14 }}>
+                  <div className="gantt-label-top">
+                    <span className={`gantt-dot ${goal.type}`} title={goalTypeLabel[goal.type]} />
+                    <strong className="gantt-title" title={goal.title}>{goal.title}</strong>
+                    <button className="icon-button" title="编辑目标" onClick={() => startEditingGoal(goal)}>
+                      <Pencil size={14} />
+                    </button>
+                    <button className="icon-button danger" title="删除目标" onClick={() => deleteGoal(goal.id)}>
+                      <Trash2 size={14} />
+                    </button>
+                  </div>
+                  <div className="gantt-label-bot">
+                    <select
+                      className="gantt-status"
+                      value={goal.status}
+                      onChange={(e) => handleStatusChange(goal, e.target.value)}
+                      title="状态"
+                    >
+                      <option value="active">进行</option>
+                      <option value="paused">暂停</option>
+                      <option value="done">完成</option>
+                    </select>
+                    <input
+                      className="gantt-progress"
+                      type="range"
+                      min="0"
+                      max="100"
+                      value={progress}
+                      disabled={progressLocked}
+                      onChange={(e) => handleProgressChange(goal, e.target.value)}
+                      title={prog.auto ? `进度由 ${prog.count} 个${prog.kind === "tasks" ? "关联任务" : "子目标"}自动汇总，不可手动调整` : "拖动调整进度"}
+                    />
+                    <span className={`gantt-pct${prog.auto ? " is-auto" : ""}`} title={prog.auto ? "由子项自动汇总" : ""}>{progress}%</span>
+                  </div>
+                </div>
+                <div className="gantt-track">
+                  {ticks.map((d) => (
+                    <span key={d} className="gantt-grid" style={{ left: `${pct(d)}%` }} />
+                  ))}
+                  {showToday && <span className="gantt-track-today" style={{ left: `${pct(today)}%` }} />}
+                  <div
+                    className={`gantt-bar status-${goal.status} priority-${goal.priority}${span.derived === "type" ? " estimated" : ""}`}
+                    style={{ left: `${left}%`, width: `${width}%` }}
+                    title={`${span.start} → ${span.end}（${span.derived === "tasks" ? "按关联任务" : "按类型估算"}）`}
+                  >
+                    <span className="gantt-bar-fill" style={{ width: `${progress}%` }} />
+                    <span className="gantt-bar-pct">{progress}%</span>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
       </div>
-    </div>
+    </section>
   );
 }
 
