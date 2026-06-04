@@ -35,6 +35,7 @@ import {
   looksLikeSingleActionItem,
   pinnableTimeForTitle,
 } from "./planningSemantics.js";
+import { tryExtractJson } from "./jsonExtract.js";
 
 const APP_NAME = "计划引航";
 const APP_SHORT_NAME = "引航";
@@ -390,30 +391,7 @@ function makeBreakdown(goal, draft, selectedDate) {
   ];
 }
 
-function extractJson(content) {
-  const text = String(content || "").trim();
-  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  const candidate = fenced?.[1] || text;
-
-  try {
-    return JSON.parse(candidate);
-  } catch {
-    const start = candidate.indexOf("{");
-    const end = candidate.lastIndexOf("}");
-    if (start >= 0 && end > start) {
-      return JSON.parse(candidate.slice(start, end + 1));
-    }
-    throw new Error("AI 返回内容不是有效 JSON。");
-  }
-}
-
-function tryExtractJson(content) {
-  try {
-    return extractJson(content);
-  } catch {
-    return null;
-  }
-}
+// JSON 解析加固抽到纯模块 src/jsonExtract.js（便于单测），见 test/jsonExtract.test.mjs。
 
 function normalizePriority(priority) {
   return ["high", "medium", "low"].includes(priority) ? priority : "medium";
@@ -475,8 +453,10 @@ function normalizeBreakdownItems(items, goal, selectedDate) {
 function normalizeTaskSuggestions(items, selectedDate) {
   return (Array.isArray(items) ? items : [])
     .map((item) => {
-      const rawStart = /^\d{2}:\d{2}$/.test(item.start) ? item.start : parseTimeInSentence(item.title || "");
-      const start = pinnableTimeForTitle(item.title, rawStart); // 购票任务不按标题时间钉定
+      // 显式 start 字段是「执行时间」（用户/模型主动指定，例如把买票放在 16:00），直接信任、钉成固定块；
+      // 只有「从标题解析出的时间」才过购票守卫——避免把车次/出发时间误当执行时间（修复购票任务给了时间仍被追问）。
+      const explicitStart = /^\d{2}:\d{2}$/.test(item.start) ? item.start : "";
+      const start = explicitStart || pinnableTimeForTitle(item.title, parseTimeInSentence(item.title || ""));
       return {
         id: uid("suggestion"),
         title: String(item.title || "").trim(),
@@ -1114,32 +1094,73 @@ function extractActionTasksFromText(text, date, existingTasks = []) {
 }
 
 async function callPlanningAi({ ai, messages, maxTokens = 1800, json = true }) {
-  const response = await fetch("/api/ai/chat", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      provider: ai.provider,
-      protocol: ai.protocol || "openai-compatible",
-      baseUrl: ai.baseUrl,
-      model: ai.model,
-      apiKey: ai.apiKey || readLocalAiKey() || undefined,
-      messages,
-      max_tokens: maxTokens,
-      temperature: 0.2,
-      response_format: json ? { type: "json_object" } : undefined,
-      thinking: { type: "disabled" },
-    }),
-  });
-
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    throw new Error(data.error?.message || data.error || "AI 调用失败。");
+  // 推理型模型（step-3.7-flash 等）会把 token 预算先花在「思考」(message.reasoning) 上，
+  // 预算太小会在写正文前就被 finish_reason=length 截断、content 为空。
+  // 所以 JSON 模式给一个较高的下限，保证「想完还能把 JSON 写出来」。非推理模型用不满，不会涨成本。
+  const effectiveMax = json ? Math.max(maxTokens, 5000) : maxTokens;
+  // 单次调用：jsonMode=是否启用严格 json_object（弱模型常因此返回空）；extra=追加的纠正消息
+  async function once(jsonMode, extra) {
+    const response = await fetch("/api/ai/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        provider: ai.provider,
+        protocol: ai.protocol || "openai-compatible",
+        baseUrl: ai.baseUrl,
+        model: ai.model,
+        apiKey: ai.apiKey || readLocalAiKey() || undefined,
+        messages: extra ? messages.concat(extra) : messages,
+        max_tokens: effectiveMax,
+        temperature: 0.2,
+        ...(jsonMode && json ? { response_format: { type: "json_object" } } : {}),
+        ...(ai.provider === "deepseek" ? { thinking: { type: "disabled" } } : {}),
+      }),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error?.message || data.error || "AI 调用失败。");
+    const top = data.choices?.[0] || {};
+    const choice = top.message || {};
+    let content = choice.content ?? choice.reasoning_content ?? "";
+    if (Array.isArray(content)) {
+      content = content.map((part) => (typeof part === "string" ? part : part?.text || "")).join("");
+    }
+    content = String(content || "").trim();
+    // 推理模型把预算用光、还没写正文：给出准确报错，而不是误判成「JSON 格式错误」
+    if (!content && top.finish_reason === "length") {
+      throw new Error("模型把 token 预算都用在思考上、正文被截断（finish_reason=length）。请调大 max_tokens，或在模型侧关闭推理模式。");
+    }
+    return content;
   }
 
-  const content = data.choices?.[0]?.message?.content;
-  if (!content) throw new Error("AI 没有返回可用内容。");
-  if (json) return extractJson(content);
-  return tryExtractJson(content) || { message: content, items: [] };
+  if (!json) {
+    const content = await once(false);
+    return tryExtractJson(content) || { message: content, items: [] };
+  }
+
+  // JSON 模式：生成 → 校验 → 修复，逐步降级，最多 3 次，让弱模型也能稳定吐 JSON
+  const tries = [
+    () => once(true),
+    () => once(false, [{ role: "user", content: "请只返回一个 JSON 对象：不要 Markdown 代码块、不要任何解释或前后缀，必须以 { 开头、以 } 结尾。" }]),
+    () => once(false, [{ role: "user", content: "上一条没有给出合法 JSON。现在只输出修正后的纯 JSON 对象，开头是 {、结尾是 }，其余一律不要。" }]),
+  ];
+  let lastError = null;
+  for (const run of tries) {
+    let content = "";
+    try {
+      content = await run();
+    } catch (error) {
+      lastError = error;
+      continue;
+    }
+    if (!content) {
+      lastError = new Error("AI 没有返回可用内容。");
+      continue;
+    }
+    const parsed = tryExtractJson(content);
+    if (parsed) return parsed;
+    lastError = new Error("AI 返回的不是有效 JSON。");
+  }
+  throw new Error(`${lastError?.message || "AI 调用失败"}（已自动重试，仍未拿到可用 JSON；可换更稳的模型如 DeepSeek）。`);
 }
 
 function usePlannerStore() {
@@ -1730,6 +1751,9 @@ function App() {
   const [serverAiKeyLoaded, setServerAiKeyLoaded] = useState(false);
   const [activeView, setActiveView] = useState("today");
   const [settingsOpen, setSettingsOpen] = useState(false); // 设置抽屉开合
+  const [theme, setTheme] = useState(() => {
+    try { return localStorage.getItem("plan-pilot-theme") || "warm"; } catch { return "warm"; }
+  });
   const [selectedDate, setSelectedDate] = useState(getLocalDate());
   const [taskDraft, setTaskDraft] = useState({
     title: "",
@@ -1800,6 +1824,29 @@ function App() {
     setScheduleUndo(null);
     setScheduleNotice({ text: "", tone: "" });
   }, [selectedDate]);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    try { localStorage.setItem("plan-pilot-theme", theme); } catch (e) { /* ignore */ }
+  }, [theme]);
+
+  // 跨天滚动 + 「现在」线随时间移动：每 30s 检查一次本地日期。
+  // 跨过午夜时，若用户仍停留在「旧的今天」，自动把视图滚到新的一天（时间线回到顶部）；手动切到别的日期则不打扰。
+  // setNowTick 仅用于触发重渲染，让 DayTimeline 里 new Date() 计算的「现在」线实时移动、并在午夜归零。
+  const todayRef = useRef(getLocalDate());
+  const [, setNowTick] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => {
+      const today = getLocalDate();
+      const prevToday = todayRef.current;
+      if (today !== prevToday) {
+        setSelectedDate((cur) => (cur === prevToday ? today : cur));
+        todayRef.current = today;
+      }
+      setNowTick((n) => (n + 1) % 100000);
+    }, 30000);
+    return () => clearInterval(id);
+  }, []);
 
   useEffect(() => {
     fetch("/api/ai/status")
@@ -2395,6 +2442,132 @@ function App() {
         .map((block) => (block.id === blockId ? { ...block, ...patch } : block)),
     }));
     setScheduleNotice({ text: "时间块已更新。再次点「自动安排」时会据此重排其余任务。", tone: "info" });
+    return true;
+  }
+
+  // 拖拽重排：被拖块放到落点（几乎可放任意时间，含非工作时段/午休——这是用户手动决定）；
+  // 只有撞到「不可用 / 固定时间」块才弹回。原本在它下方、且现在会冲突的任务块温和顺延（跳过硬锚点）。永不删块。
+  function applyDragReschedule(blockId, newStartMin, newEndMin) {
+    const date = selectedDate;
+    const moved = planner.blocks.find((b) => b.id === blockId);
+    if (!moved) return false;
+    const origStart = toMinutes(moved.start);
+    let startMin;
+    let endMin;
+    if (newStartMin !== origStart) {
+      // 移动：保持时长，整体限制在 00:00–24:00
+      const dur = Math.max(10, newEndMin - newStartMin);
+      startMin = Math.max(0, Math.min(newStartMin, 1440 - dur));
+      endMin = startMin + dur;
+    } else {
+      // 拉伸：固定开始，结束封顶 24:00
+      startMin = origStart;
+      endMin = Math.max(startMin + 10, Math.min(newEndMin, 1440));
+    }
+    const ns = startMin;
+    const dur0 = endMin - startMin;
+    const movedNew = { ...moved, start: toTime(startMin), end: toTime(endMin), auto: false }; // 手动拖动后视为手动放置
+    const today = planner.blocks.filter((b) => b.date === date);
+    const others = planner.blocks.filter((b) => b.date !== date);
+    // 硬锚点：不可用块 + 固定时间任务块（不能重叠）
+    const hard = today.filter((b) => b.id !== blockId && (b.type === "busy" || b.fixedTime));
+    if (hard.some((a) => overlapsAny(movedNew, [a]))) {
+      setScheduleNotice({ text: "这里是不可用 / 固定时间安排，不能放在它上面，已弹回。", tone: "error" });
+      return false;
+    }
+    const hardIv = hard.map((a) => [toMinutes(a.start), toMinutes(a.end)]);
+    const pushPastHard = (start, dur) => {
+      let s = start;
+      let again = true;
+      while (again) {
+        again = false;
+        for (const [hs, he] of hardIv) {
+          if (s < he && s + dur > hs) {
+            s = he;
+            again = true;
+          }
+        }
+      }
+      return s;
+    };
+    // 可顺延：当天其它任务块（非不可用、非固定时间），按开始排序
+    const movable = today
+      .filter((b) => b.id !== blockId && b.type !== "busy" && !b.fixedTime)
+      .sort((a, b) => toMinutes(a.start) - toMinutes(b.start));
+    const movedOrigStart = toMinutes(moved.start);
+    let cursor = ns + dur0;
+    const newMovable = movable.map((b) => {
+      const bs = toMinutes(b.start);
+      const bdur = duration(b.start, b.end);
+      if (bs >= movedOrigStart && bs < cursor) {
+        const s = pushPastHard(cursor, bdur);
+        if (s + bdur <= 1440) {
+          cursor = s + bdur;
+          return { ...b, start: toTime(s), end: toTime(s + bdur) };
+        }
+        return b; // 顺延会超过 24:00 → 保持原位，不推到 25 点
+      }
+      if (bs >= movedOrigStart) cursor = Math.max(cursor, bs + bdur);
+      return b;
+    });
+    patchPlanner({ blocks: others.concat(hard, [movedNew], newMovable) });
+    setScheduleNotice({ text: "已移动；下方冲突的任务已联动顺延。", tone: "info" });
+    return true;
+  }
+
+  // 把右侧待办任务拖到时间轴落点：已在轴上则按拖拽重排移动（含联动顺延）；否则在落点新建手动块（auto:false）。
+  // 与拖拽一致：几乎可放任意时间，只有撞「不可用 / 固定时间」才拒绝；落点夹在 00:00–24:00 内。
+  function scheduleTaskAtMinute(taskId, startMin) {
+    const task = planner.tasks.find((t) => t.id === taskId);
+    if (!task) return false;
+    const today = planner.blocks.filter((b) => b.date === selectedDate);
+    const existing = today.find((b) => b.taskId === taskId && b.type !== "busy");
+    if (existing) {
+      return applyDragReschedule(existing.id, startMin, startMin + duration(existing.start, existing.end));
+    }
+    const estimate = Math.max(10, estimateMinutesForTitle(task.title, Number(task.estimateMinutes) || 30));
+    const start = Math.max(0, Math.min(startMin, 1440 - estimate));
+    const end = start + estimate;
+    const candidate = { start: toTime(start), end: toTime(end) };
+    // 硬锚点：不可用块 + 固定时间块，不能压上去
+    const hard = today.filter((b) => b.type === "busy" || b.fixedTime);
+    if (hard.some((a) => overlapsAny(candidate, [a]))) {
+      setScheduleNotice({ text: `「${task.title}」放到 ${toTime(start)} 会和不可用 / 固定时间冲突，换个空档再放。`, tone: "error" });
+      return false;
+    }
+    // 温和顺延：落点处及其下方、与新块冲突的可动块依次下移（跳过硬锚点、封顶 24:00），不删块、不视觉重叠。
+    const hardIv = hard.map((a) => [toMinutes(a.start), toMinutes(a.end)]);
+    const pushPastHard = (s, dur) => {
+      let cur = s;
+      let again = true;
+      while (again) {
+        again = false;
+        for (const [hs, he] of hardIv) {
+          if (cur < he && cur + dur > hs) { cur = he; again = true; }
+        }
+      }
+      return cur;
+    };
+    const movable = today
+      .filter((b) => b.type !== "busy" && !b.fixedTime)
+      .sort((a, b) => toMinutes(a.start) - toMinutes(b.start));
+    let cursor = end;
+    const newMovable = movable.map((b) => {
+      const bs = toMinutes(b.start);
+      const bdur = duration(b.start, b.end);
+      if (bs >= start && bs < cursor) {
+        const s = pushPastHard(cursor, bdur);
+        if (s + bdur <= 1440) { cursor = s + bdur; return { ...b, start: toTime(s), end: toTime(s + bdur) }; }
+        return b; // 顺延会超过 24:00 → 保持原位
+      }
+      if (bs >= start) cursor = Math.max(cursor, bs + bdur);
+      return b;
+    });
+    const block = { id: uid("block"), taskId, title: "", type: "task", date: selectedDate, start: toTime(start), end: toTime(end), auto: false };
+    const others = planner.blocks.filter((b) => b.date !== selectedDate);
+    patchPlanner({ blocks: others.concat(hard, newMovable, [block]) });
+    setScheduleQuestions((qs) => qs.filter((q) => q.taskId !== taskId));
+    setScheduleNotice({ text: `已把「${task.title}」安排到 ${toTime(start)}–${toTime(end)}（拖动可微调，下方冲突已顺延）。`, tone: "info" });
     return true;
   }
 
@@ -3024,6 +3197,14 @@ function App() {
         </div>
 
         <section className="settings-panel">
+          <label className="theme-select" style={{ gridColumn: "1 / -1" }}>
+            外观主题
+            <select value={theme} onChange={(event) => setTheme(event.target.value)}>
+              <option value="warm">暖象牙（默认）</option>
+              <option value="cool">冷蓝清新</option>
+              <option value="graphite">墨灰</option>
+            </select>
+          </label>
           <div className="work-segments-label">工作时段</div>
           {(planner.settings.workSegments || []).map((seg) => (
             <div className="work-segment-item" key={`${seg.start}-${seg.end}`}>
@@ -3382,6 +3563,8 @@ function App() {
             addBlockDirectly={addBlockDirectly}
             deleteBlock={deleteBlock}
             updateBlock={updateBlock}
+            applyDragReschedule={applyDragReschedule}
+            scheduleTaskAtMinute={scheduleTaskAtMinute}
             aiStatus={aiStatus}
             aiTaskSuggestions={aiTaskSuggestions}
             generateTodayAiGuide={generateTodayAiGuide}
@@ -3446,6 +3629,175 @@ function getGuideQuestion({ dayPlan, todayTasks, todayBlocks, plannedMinutes, wo
   return "按当前节奏推进，晚上做一次轻复盘。";
 }
 
+function DayTimeline({ blocks, taskById, settings, selectedDate, onReschedule, onDropTask, onEdit, onDelete }) {
+  const PXH = 56; // 每小时像素
+  const ppm = PXH / 60;
+  const segs = settings.workSegments || [];
+  const hasContent = segs.length > 0 || blocks.length > 0; // 是否有可显示内容（否则给空态提示）
+  const [drag, setDrag] = useState(null); // { id, mode:"move"|"resize", startY, origStart, origEnd, deltaMin }
+  const rootRef = useRef(null); // 容器，用于把落点 clientY 换算成分钟
+  const [dropMin, setDropMin] = useState(null); // 外部任务拖入时的落点指示（分钟）
+
+  useEffect(() => {
+    if (!drag) return undefined;
+    function onMove(e) {
+      const deltaMin = Math.round((e.clientY - drag.startY) / ppm / 5) * 5; // 吸附 5 分钟
+      setDrag((d) => (d ? { ...d, deltaMin } : d));
+    }
+    function onUp() {
+      setDrag((d) => {
+        if (d && d.deltaMin) {
+          const dur = d.origEnd - d.origStart;
+          if (d.mode === "resize") {
+            onReschedule(d.id, d.origStart, Math.max(d.origStart + 15, d.origEnd + d.deltaMin));
+          } else {
+            onReschedule(d.id, d.origStart + d.deltaMin, d.origStart + d.deltaMin + dur);
+          }
+        }
+        return null;
+      });
+    }
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    return () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    };
+  }, [drag?.id, drag?.mode]);
+
+  // 全天 0–24 较高、容器内部滚动；切换日期/进入时自动定位到「现在」（非今天则定位到首个块/工作开始），
+  // 让关注点上方留约 1 小时，避免一进来停在凌晨空白区。
+  useEffect(() => {
+    const el = rootRef.current;
+    if (!el) return;
+    const now = new Date();
+    const focusMin =
+      selectedDate === getLocalDate()
+        ? now.getHours() * 60 + now.getMinutes()
+        : blocks.length
+          ? Math.min(...blocks.map((b) => toMinutes(b.start)))
+          : segs[0]
+            ? toMinutes(segs[0].start)
+            : 8 * 60;
+    el.scrollTop = Math.max(0, (focusMin - 60) * ppm);
+  }, [selectedDate]);
+
+  if (!hasContent) {
+    return <EmptyState icon={<Clock3 size={22} />} text="还没有时间块。先在设置里配置工作时段，或在上面加任务后点自动安排。" />;
+  }
+  // 固定显示完整一天 00:00–24:00：小时标签 0–23（最后一格 23:00），容器高度铺到 24:00，
+  // 这样「现在」线在任何时刻（含 23:xx）都落在范围内、不会越出底部看不见。
+  const dayStart = 0;
+  const dayEnd = 1440;
+  const totalMin = dayEnd - dayStart;
+  const hours = [];
+  for (let m = dayStart; m < dayEnd; m += 60) hours.push(m);
+  const nowDate = new Date();
+  const nowMin = selectedDate === getLocalDate() ? nowDate.getHours() * 60 + nowDate.getMinutes() : null;
+
+  function startDrag(e, block, mode) {
+    if (e.button !== undefined && e.button !== 0) return;
+    e.preventDefault();
+    setDrag({ id: block.id, mode, startY: e.clientY, origStart: toMinutes(block.start), origEnd: toMinutes(block.end), deltaMin: 0 });
+  }
+
+  // 把落点 clientY 换算成分钟（减去顶部 8px padding，吸附 5 分钟，夹在当天范围内）
+  function yToMinute(clientY) {
+    const rect = rootRef.current?.getBoundingClientRect();
+    if (!rect) return dayStart;
+    const m = dayStart + (clientY - rect.top - 8) / ppm;
+    return Math.max(dayStart, Math.min(dayEnd, Math.round(m / 5) * 5));
+  }
+  function onDragOverTimeline(e) {
+    if (!onDropTask) return;
+    e.preventDefault(); // 必须 preventDefault 才能触发 drop
+    e.dataTransfer.dropEffect = "copy";
+    setDropMin(yToMinute(e.clientY));
+  }
+  function onDropTimeline(e) {
+    if (!onDropTask) return;
+    e.preventDefault();
+    const taskId = e.dataTransfer.getData("text/plain");
+    const minute = yToMinute(e.clientY);
+    setDropMin(null);
+    if (taskId) onDropTask(taskId, minute);
+  }
+
+  return (
+    <div
+      className="day-timeline"
+      ref={rootRef}
+      style={{ height: totalMin * ppm + 18 }}
+      onDragOver={onDragOverTimeline}
+      onDragLeave={(e) => { if (e.currentTarget === e.target) setDropMin(null); }}
+      onDrop={onDropTimeline}
+    >
+      {hours.map((m) => (
+        <div className="dt-hour" key={m} style={{ top: (m - dayStart) * ppm + 8 }}>
+          <span>{toTime(m)}</span>
+        </div>
+      ))}
+      {blocks.map((block) => {
+        const task = taskById[block.taskId];
+        const busy = block.type === "busy" || (!block.taskId && !block.auto);
+        const title = task?.title || block.title || (busy ? "固定占用" : "自定义安排");
+        const isDragging = drag?.id === block.id;
+        const dMove = isDragging && drag.mode === "move" ? drag.deltaMin : 0;
+        const dResize = isDragging && drag.mode === "resize" ? drag.deltaMin : 0;
+        const startMin = toMinutes(block.start) + dMove;
+        const endMin = toMinutes(block.end) + dMove + dResize;
+        const top = (startMin - dayStart) * ppm + 8;
+        const h = Math.max(30, (endMin - startMin) * ppm);
+        let cls = "deep";
+        if (busy) cls = isMeetingSentence(title) ? "meet" : "busy";
+        else if (task?.kind === "fixed") cls = "meet";
+        return (
+          <article
+            className={`dt-blk dt-${cls}${isDragging ? " dragging" : ""}`}
+            key={block.id}
+            style={{ top, height: h }}
+            onPointerDown={(e) => startDrag(e, block, "move")}
+          >
+            <div className="dt-body">
+              <div className="dt-bt">{title}</div>
+              <div className="dt-bm">
+                {toTime(startMin)}–{toTime(endMin)} · {endMin - startMin}分钟
+                {busy ? " · 不可用" : block.auto ? " · 自动" : ""}
+              </div>
+            </div>
+            <div className="dt-actions">
+              <button title="编辑" onPointerDown={(e) => e.stopPropagation()} onClick={() => onEdit(block)}>
+                <Pencil size={14} />
+              </button>
+              <button title="删除" onPointerDown={(e) => e.stopPropagation()} onClick={() => onDelete(block.id)}>
+                <Trash2 size={14} />
+              </button>
+            </div>
+            <div
+              className="dt-resize"
+              title="拖动改时长"
+              onPointerDown={(e) => {
+                e.stopPropagation();
+                startDrag(e, block, "resize");
+              }}
+            />
+          </article>
+        );
+      })}
+      {nowMin != null && nowMin >= dayStart && nowMin <= dayEnd && (
+        <div className="dt-now" style={{ top: (nowMin - dayStart) * ppm + 8 }}>
+          <b>现在 {toTime(nowMin)}</b>
+        </div>
+      )}
+      {dropMin != null && (
+        <div className="dt-drop" style={{ top: (dropMin - dayStart) * ppm + 8 }}>
+          <b>放到 {toTime(dropMin)}</b>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function TodayView({
   planner,
   dayPlan,
@@ -3486,6 +3838,8 @@ function TodayView({
   addBlockDirectly,
   deleteBlock,
   updateBlock,
+  applyDragReschedule,
+  scheduleTaskAtMinute,
   aiStatus,
   aiTaskSuggestions,
   generateTodayAiGuide,
@@ -3591,10 +3945,8 @@ function TodayView({
     setEditingTaskId(null);
   }
 
-  const layoutClass = dayPlan.morningDone ? "today-grid layout-done" : "today-grid";
-
   return (
-    <div className={layoutClass}>
+    <div className="cockpit-grid">
       <section className="coach-band">
         <div className="coach-copy">
           <div>
@@ -3894,7 +4246,16 @@ function TodayView({
               }
 
               return (
-              <article className={`task-item ${task.status === "done" ? "done" : ""}${task.kind === "fixed" ? " fixed" : ""}${task.kind !== "fixed" ? " priority-" + task.priority : ""}`} key={task.id}>
+              <article
+                className={`task-item is-draggable ${task.status === "done" ? "done" : ""}${task.kind === "fixed" ? " fixed" : ""}${task.kind !== "fixed" ? " priority-" + task.priority : ""}`}
+                key={task.id}
+                draggable
+                onDragStart={(e) => {
+                  e.dataTransfer.setData("text/plain", task.id);
+                  e.dataTransfer.effectAllowed = "copy";
+                }}
+                title="拖到右侧时间轴可安排到具体时间"
+              >
                 <button
                   className="check-button"
                   title={task.status === "done" ? "标记未完成" : "标记完成"}
@@ -4138,92 +4499,34 @@ function TodayView({
           </div>
         )}
 
-        <div className="timeline">
-          {todayBlocks.length === 0 && <EmptyState icon={<Clock3 size={22} />} text="还没有时间块。" />}
-          {todayBlocks.map((block, bi) => {
-            const task = taskById[block.taskId];
-            const busy = block.type === "busy" || (!block.taskId && !block.auto);
-            const title = task?.title || block.title || (busy ? "固定占用" : "自定义安排");
-            const isEditing = editingBlockId === block.id;
-            const segs = planner.settings.workSegments || [];
-            const blockMid = toMinutes(block.start) + duration(block.start, block.end) / 2;
-            const curSegIdx = segs.findIndex((s) => blockMid >= toMinutes(s.start) && blockMid <= toMinutes(s.end));
-            let prevSegIdx = -1;
-            if (bi > 0) {
-              const prev = todayBlocks[bi - 1];
-              const prevMid = toMinutes(prev.start) + duration(prev.start, prev.end) / 2;
-              prevSegIdx = segs.findIndex((s) => prevMid >= toMinutes(s.start) && prevMid <= toMinutes(s.end));
-            }
-            const showDivider = prevSegIdx >= 0 && curSegIdx >= 0 && prevSegIdx !== curSegIdx;
+        {editingBlockId && (
+          <div className="dt-editbar">
+            <input type="time" lang="zh-CN" value={blockEditDraft.start}
+              onChange={(e) => setBlockEditDraft((d) => ({ ...d, start: e.target.value }))} aria-label="开始时间" />
+            <input type="time" lang="zh-CN" value={blockEditDraft.end}
+              onChange={(e) => setBlockEditDraft((d) => ({ ...d, end: e.target.value }))} aria-label="结束时间" />
+            <select value={blockEditDraft.type}
+              onChange={(e) => setBlockEditDraft((d) => ({ ...d, type: e.target.value }))}>
+              <option value="task">任务</option>
+              <option value="busy">不可用</option>
+            </select>
+            <input className="dt-edit-title" value={blockEditDraft.title}
+              onChange={(e) => setBlockEditDraft((d) => ({ ...d, title: e.target.value }))} placeholder="标题（可选）" />
+            <button className="btn-text" onClick={() => saveEditingBlock(editingBlockId)}>保存</button>
+            <button className="btn-text" onClick={cancelEditingBlock}>取消</button>
+          </div>
+        )}
 
-            if (isEditing) {
-              return (
-                <React.Fragment key={block.id}>
-                  {showDivider && (
-                    <div className="time-segment-divider">
-                      {segs[prevSegIdx].start}-{segs[prevSegIdx].end} ↑ {segs[curSegIdx].start}-{segs[curSegIdx].end} ↓
-                    </div>
-                  )}
-                  <article className="time-block editing">
-                    <div className="block-edit-form">
-                      <div className="block-edit-row">
-                        <input type="time" lang="zh-CN" value={blockEditDraft.start}
-                          onChange={(e) => setBlockEditDraft((d) => ({ ...d, start: e.target.value }))} aria-label="开始时间" />
-                        <input type="time" lang="zh-CN" value={blockEditDraft.end}
-                          onChange={(e) => setBlockEditDraft((d) => ({ ...d, end: e.target.value }))} aria-label="结束时间" />
-                        <select value={blockEditDraft.type}
-                          onChange={(e) => setBlockEditDraft((d) => ({ ...d, type: e.target.value }))}>
-                          <option value="task">任务</option>
-                          <option value="busy">不可用</option>
-                        </select>
-                      </div>
-                      <input value={blockEditDraft.title}
-                        onChange={(e) => setBlockEditDraft((d) => ({ ...d, title: e.target.value }))} placeholder="标题（可选）" />
-                      <div className="edit-task-actions">
-                        <button className="secondary-action" onClick={() => saveEditingBlock(block.id)}>保存</button>
-                        <button className="secondary-action" onClick={cancelEditingBlock}>取消</button>
-                      </div>
-                    </div>
-                  </article>
-                </React.Fragment>
-              );
-            }
-
-            let priorityClass = "";
-            if (busy || task?.kind === "fixed") { priorityClass = "tb-fixed"; }
-            else if (task) { priorityClass = `tb-${task.priority}`; }
-            else if (block.auto) { priorityClass = "tb-auto"; }
-
-            return (
-              <React.Fragment key={block.id}>
-                {showDivider && (
-                  <div className="time-segment-divider">
-                    {segs[prevSegIdx].start}-{segs[prevSegIdx].end} ↑ {segs[curSegIdx].start}-{segs[curSegIdx].end} ↓
-                  </div>
-                )}
-                <article className={`time-block ${priorityClass}`}>
-                  <div className="time-range">
-                    <strong>{block.start}</strong>
-                    <span>{block.end}</span>
-                  </div>
-                  <div className="time-body">
-                    <strong>{title}</strong>
-                    <span>
-                      {duration(block.start, block.end)} 分钟
-                      {busy ? " · 不可安排" : block.auto ? " · 自动" : ""}
-                    </span>
-                  </div>
-                  <button title="编辑时间块" className="icon-button" onClick={() => startEditingBlock(block)}>
-                    <Pencil size={17} />
-                  </button>
-                  <button title="删除时间块" className="icon-button danger" onClick={() => deleteBlock(block.id)}>
-                    <Trash2 size={17} />
-                  </button>
-                </article>
-              </React.Fragment>
-            );
-          })}
-        </div>
+        <DayTimeline
+          blocks={todayBlocks}
+          taskById={taskById}
+          settings={planner.settings}
+          selectedDate={selectedDate}
+          onReschedule={applyDragReschedule}
+          onDropTask={scheduleTaskAtMinute}
+          onEdit={startEditingBlock}
+          onDelete={deleteBlock}
+        />
       </section>
     </div>
   );
