@@ -1893,7 +1893,6 @@ function App() {
   );
   const availableMinutes = Math.max(0, workMinutes - busyMinutes);
   const completedCount = todayTasks.filter((task) => task.status === "done").length;
-  const guideQuestion = getGuideQuestion({ dayPlan, todayTasks, todayBlocks, plannedMinutes, workMinutes: availableMinutes });
   const upcomingHighlights = useMemo(() => {
     const weekGoals = planner.goals
       .filter((g) => g.type === "week" && g.status === "active")
@@ -1922,7 +1921,7 @@ function App() {
       month: monthGoal ? { ...monthGoal, parentTitle: monthGoal.parentId ? goalById[monthGoal.parentId]?.title : "" } : null,
       busy,
     };
-  }, [planner.goals, planner.blocks, selectedDate]);
+  }, [planner.goals, planner.blocks, planner.tasks, selectedDate]);
 
   // 今日建议对话进行中（已生成、且 AI 尚未判定 done）就一直显示回答框，支持「持续引导直到用户说没有更多」。
   const showAiFollowUp = todayGuideActive && !aiStatus.loading;
@@ -2972,10 +2971,11 @@ function App() {
       };
     }
 
-    const acceptance = prepareAcceptance(planner);
+    let summary;
 
     patchPlanner((current) => {
       const prepared = prepareAcceptance(current);
+      summary = prepared.summary;
       return {
         goals: current.goals.concat(prepared.goals),
         tasks: mergeDuplicateTasks(current.tasks.concat(prepared.tasks)),
@@ -2988,7 +2988,7 @@ function App() {
       suggestions: [],
       messages: coach.messages.concat({
         role: "assistant",
-        content: `已加入计划：${acceptance.summary.goals} 个目标、${acceptance.summary.tasks} 个任务（今日 ${acceptance.summary.todayTasks} 个，后续 ${acceptance.summary.futureTasks} 个）、${acceptance.summary.busy} 个固定安排。后续任务可在"目标"页的后续任务区查看。`,
+        content: `已加入计划：${summary.goals} 个目标、${summary.tasks} 个任务（今日 ${summary.todayTasks} 个，后续 ${summary.futureTasks} 个）、${summary.busy} 个固定安排。后续任务可在"目标"页的后续任务区查看。`,
       }),
     }));
   }
@@ -3522,6 +3522,7 @@ function App() {
           </div>
         </header>
 
+        <ErrorBoundary>
         {activeView === "today" && (
           <TodayView
             planner={planner}
@@ -3615,18 +3616,10 @@ function App() {
             reviews={planner.reviews}
           />
         )}
+        </ErrorBoundary>
       </section>
     </main>
   );
-}
-
-function getGuideQuestion({ dayPlan, todayTasks, todayBlocks, plannedMinutes, workMinutes }) {
-  if (!dayPlan.morningDone) return "今天最值得推进的 1-3 件事是什么？";
-  if (todayTasks.length === 0) return "先把今天的新任务收进来。";
-  if (plannedMinutes > workMinutes) return "今天任务超载了，要删减、顺延还是降低标准？";
-  if (todayBlocks.length === 0) return "把任务放进时间块，今天会更稳。";
-  if (dayPlan.changes?.trim()) return "这些变化会影响本周或本月计划吗？";
-  return "按当前节奏推进，晚上做一次轻复盘。";
 }
 
 function DayTimeline({ blocks, taskById, settings, selectedDate, onReschedule, onDropTask, onEdit, onDelete }) {
