@@ -949,7 +949,13 @@ function extractActionTasksFromText(text, date, existingTasks = []) {
     });
 }
 
-async function callPlanningAi({ ai, messages, maxTokens = 1800, json = true }) {
+async function callPlanningAi({ ai, messages, maxTokens = 1800, json = true, serverKeyOk = false }) {
+  // 浏览器 + 服务端都没 Key 时直接抛错，避免触发 400 网络请求。
+  // serverKeyOk 由调用方根据 mount 时 /api/ai/status 的查询结果传入。
+  const apiKey = ai.apiKey || readLocalAiKey() || undefined;
+  if (!apiKey && !serverKeyOk) {
+    throw new Error("未配置 API Key。请在设置中添加浏览器 Key，或检查服务端环境变量（AI_API_KEY / DEEPSEEK_API_KEY / ANTHROPIC_API_KEY）。");
+  }
   // 推理型模型（step-3.7-flash 等）会把 token 预算先花在「思考」(message.reasoning) 上，
   // 预算太小会在写正文前就被 finish_reason=length 截断、content 为空。
   // 所以 JSON 模式给一个较高的下限，保证「想完还能把 JSON 写出来」。非推理模型用不满，不会涨成本。
@@ -964,7 +970,7 @@ async function callPlanningAi({ ai, messages, maxTokens = 1800, json = true }) {
         protocol: ai.protocol || "openai-compatible",
         baseUrl: ai.baseUrl,
         model: ai.model,
-        apiKey: ai.apiKey || readLocalAiKey() || undefined,
+        apiKey,
         messages: extra ? messages.concat(extra) : messages,
         max_tokens: effectiveMax,
         temperature: 0.2,
@@ -2056,6 +2062,7 @@ function App() {
     try {
       const result = await callPlanningAi({
         ai: planner.ai,
+        serverKeyOk: serverAiKeyLoaded,
         maxTokens: 2000,
         messages: [
           {
@@ -2456,6 +2463,7 @@ function App() {
     try {
       const result = await callPlanningAi({
         ai: planner.ai,
+        serverKeyOk: serverAiKeyLoaded,
         maxTokens: 1800,
         messages: [
           {
@@ -2555,6 +2563,7 @@ function App() {
     try {
       const result = await callPlanningAi({
         ai: planner.ai,
+        serverKeyOk: serverAiKeyLoaded,
         maxTokens: 1600,
         messages: [
           {
@@ -2663,6 +2672,7 @@ function App() {
     try {
       const result = await callPlanningAi({
         ai: planner.ai,
+        serverKeyOk: serverAiKeyLoaded,
         maxTokens: 1800,
         messages: [
           ...planningCoachSystemMessages(),
@@ -2958,6 +2968,7 @@ function App() {
       const profile = await fetch("/api/profile").then((r) => r.json()).catch(() => ({}));
       const result = await callPlanningAi({
         ai: planner.ai,
+        serverKeyOk: serverAiKeyLoaded,
         maxTokens: 800,
         messages: [
           {
@@ -3307,8 +3318,12 @@ function App() {
             </label>
           </details>
           <p>
-            当前协议：{planner.ai.protocol === "anthropic" ? "Anthropic Messages" : "OpenAI 兼容"}。Key
-            只保存在本机浏览器，本地原型会通过当前 dev server 代理请求。
+            当前协议：{planner.ai.protocol === "anthropic" ? "Anthropic Messages" : "OpenAI 兼容"}。
+            {serverAiKeyLoaded
+              ? "已检测到服务端环境变量（AI_API_KEY / DEEPSEEK_API_KEY / ANTHROPIC_API_KEY），Key 不会持久化到服务器或数据文件中。如需改用浏览器 Key，清空环境变量后在上方输入框填写即可。"
+              : localAiKey.trim()
+                ? "浏览器 Key 存储在本地 localStorage，每次调用随请求临时传入本机代理，不会持久化到服务器或数据文件中。如需切换为服务端 Key，可配置环境变量（AI_API_KEY / DEEPSEEK_API_KEY / ANTHROPIC_API_KEY）或项目根目录 .env 文件，然后清空上方输入框。"
+                : "Key 可填写在上方输入框（存储在浏览器 localStorage），也可通过服务端环境变量（AI_API_KEY / DEEPSEEK_API_KEY / ANTHROPIC_API_KEY）或项目根目录 .env 文件配置。"}
           </p>
           {currentAiPreset.note && <p className="ai-provider-note">{currentAiPreset.note}</p>}
         </section>
@@ -3600,6 +3615,9 @@ function DayTimeline({ blocks, taskById, settings, selectedDate, onReschedule, o
         let cls = "deep";
         if (busy) cls = isMeetingSentence(title) ? "meet" : "busy";
         else if (task?.kind === "fixed") cls = "meet";
+        else if (task?.priority === "high") cls = "priority-high";
+        else if (task?.priority === "medium") cls = "priority-medium";
+        else if (task?.priority === "low") cls = "priority-low";
         return (
           <article
             className={`dt-blk dt-${cls}${isDragging ? " dragging" : ""}`}
