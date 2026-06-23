@@ -40,6 +40,17 @@ import {
 import { tryExtractJson } from "./jsonExtract.js";
 import { APP_NAME, APP_SHORT_NAME, STORAGE_KEY, AI_KEY_STORAGE_KEY } from "./constants/appConstants.js";
 import { AI_PROVIDER_PRESETS, getAiProviderPreset } from "./constants/aiProviders.js";
+import { uid } from "./utils/ids.js";
+import {
+  addDays,
+  dayDiff,
+  duration,
+  formatHumanDate,
+  formatShortDate,
+  getLocalDate,
+  toMinutes,
+  toTime,
+} from "./utils/dateTime.js";
 import {
   priorityOrder,
   priorityLabel,
@@ -70,17 +81,6 @@ const defaultState = {
   reviews: [],
   recurring: [],
 };
-
-function uid(prefix) {
-  return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-}
-
-function getLocalDate(date = new Date()) {
-  const year = date.getFullYear();
-  const month = `${date.getMonth() + 1}`.padStart(2, "0");
-  const day = `${date.getDate()}`.padStart(2, "0");
-  return `${year}-${month}-${day}`;
-}
 
 function readLocalAiKey() {
   try {
@@ -141,41 +141,6 @@ function replaceRecurringBlocks(items, blocks = []) {
   return manualBlocks.concat(expandRecurringBlocks(items, manualBlocks));
 }
 
-function addDays(dateString, amount) {
-  const [year, month, day] = dateString.split("-").map(Number);
-  const date = new Date(year, month - 1, day);
-  date.setDate(date.getDate() + amount);
-  return getLocalDate(date);
-}
-
-function formatShortDate(dateString) {
-  const [year, month, day] = dateString.split("-").map(Number);
-  return `${month}月${day}日`;
-}
-
-function formatHumanDate(dateString) {
-  const [year, month, day] = dateString.split("-").map(Number);
-  return new Intl.DateTimeFormat("zh-CN", {
-    month: "long",
-    day: "numeric",
-    weekday: "long",
-  }).format(new Date(year, month - 1, day));
-}
-
-function toMinutes(time) {
-  const [hours, minutes] = time.split(":").map(Number);
-  return hours * 60 + minutes;
-}
-
-function toTime(minutes) {
-  const hours = `${Math.floor(minutes / 60)}`.padStart(2, "0");
-  const mins = `${minutes % 60}`.padStart(2, "0");
-  return `${hours}:${mins}`;
-}
-
-function duration(start, end) {
-  return Math.max(0, toMinutes(end) - toMinutes(start));
-}
 
 function sum(values) {
   return values.reduce((total, item) => total + item, 0);
@@ -4777,13 +4742,6 @@ function GoalsView({
       />
     </div>
   );
-}
-
-// 两个 YYYY-MM-DD 的天数差（b - a），用 UTC 避免夏令时误差
-function dayDiff(a, b) {
-  const [ay, am, ad] = a.split("-").map(Number);
-  const [by, bm, bd] = b.split("-").map(Number);
-  return Math.round((Date.UTC(by, bm - 1, bd) - Date.UTC(ay, am - 1, ad)) / 86400000);
 }
 
 // 甘特图数据：每个目标的时间跨度（优先取「该目标及其子目标」关联任务的日期范围，无任务则按类型从今天给默认区间），
