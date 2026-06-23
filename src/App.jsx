@@ -38,9 +38,10 @@ import {
   pinnableTimeForTitle,
 } from "./planningSemantics.js";
 import { tryExtractJson } from "./jsonExtract.js";
-import { APP_NAME, APP_SHORT_NAME, STORAGE_KEY, AI_KEY_STORAGE_KEY } from "./constants/appConstants.js";
+import { APP_NAME, APP_SHORT_NAME, STORAGE_KEY } from "./constants/appConstants.js";
 import { AI_PROVIDER_PRESETS, getAiProviderPreset } from "./constants/aiProviders.js";
 import { defaultState } from "./app/initialState.js";
+import { useLocalAiKey } from "./hooks/useLocalAiKey.js";
 import { uid } from "./utils/ids.js";
 import {
   addDays,
@@ -60,14 +61,6 @@ import {
   energyColorMap,
   energyColor,
 } from "./constants/labels.js";
-
-function readLocalAiKey() {
-  try {
-    return localStorage.getItem(AI_KEY_STORAGE_KEY) || "";
-  } catch {
-    return "";
-  }
-}
 
 function isRecurringDerivedBlock(block) {
   return Boolean(block?.recurringDerived) || String(block?.id || "").startsWith("rec-");
@@ -895,10 +888,10 @@ function extractActionTasksFromText(text, date, existingTasks = []) {
     });
 }
 
-async function callPlanningAi({ ai, messages, maxTokens = 1800, json = true, serverKeyOk = false }) {
+async function callPlanningAi({ ai, apiKey: explicitApiKey, messages, maxTokens = 1800, json = true, serverKeyOk = false }) {
   // 浏览器 + 服务端都没 Key 时直接抛错，避免触发 400 网络请求。
   // serverKeyOk 由调用方根据 mount 时 /api/ai/status 的查询结果传入。
-  const apiKey = ai.apiKey || readLocalAiKey() || undefined;
+  const apiKey = explicitApiKey || ai.apiKey || undefined;
   if (!apiKey && !serverKeyOk) {
     throw new Error("未配置 API Key。请在设置中添加浏览器 Key，或检查服务端环境变量（AI_API_KEY / DEEPSEEK_API_KEY / ANTHROPIC_API_KEY）。");
   }
@@ -1634,7 +1627,7 @@ function buildAutoBlocks({ tasks, existingBlocks, settings, selectedDate }) {
 function App() {
   const [planner, setPlanner] = usePlannerStore();
   const autoSchedulingRef = useRef(false); // 防自动安排并发（每实例，替代模块全局）—— from PR #6 (hrjtju)
-  const [localAiKey, setLocalAiKey] = useState(readLocalAiKey);
+  const [localAiKey, updateLocalAiKey] = useLocalAiKey();
   const [serverAiKeyLoaded, setServerAiKeyLoaded] = useState(false);
   const [activeView, setActiveView] = useState("today");
   const [settingsOpen, setSettingsOpen] = useState(false); // 设置抽屉开合
@@ -1846,16 +1839,6 @@ function App() {
     patchPlanner((current) => ({
       ai: { ...current.ai, ...patch },
     }));
-  }
-
-  function updateLocalAiKey(value) {
-    setLocalAiKey(value);
-    try {
-      if (value) localStorage.setItem(AI_KEY_STORAGE_KEY, value);
-      else localStorage.removeItem(AI_KEY_STORAGE_KEY);
-    } catch (error) {
-      console.error("AI key localStorage write failed:", error);
-    }
   }
 
   function applyAiProviderPreset(provider) {
@@ -2097,6 +2080,7 @@ function App() {
     try {
       const result = await callPlanningAi({
         ai: planner.ai,
+        apiKey: localAiKey,
         serverKeyOk: serverAiKeyLoaded,
         maxTokens: 2000,
         messages: [
@@ -2503,6 +2487,7 @@ function App() {
     try {
       const result = await callPlanningAi({
         ai: planner.ai,
+        apiKey: localAiKey,
         serverKeyOk: serverAiKeyLoaded,
         maxTokens: 1800,
         messages: [
@@ -2603,6 +2588,7 @@ function App() {
     try {
       const result = await callPlanningAi({
         ai: planner.ai,
+        apiKey: localAiKey,
         serverKeyOk: serverAiKeyLoaded,
         maxTokens: 1600,
         messages: [
@@ -2712,6 +2698,7 @@ function App() {
     try {
       const result = await callPlanningAi({
         ai: planner.ai,
+        apiKey: localAiKey,
         serverKeyOk: serverAiKeyLoaded,
         maxTokens: 1800,
         messages: [
@@ -3008,6 +2995,7 @@ function App() {
       const profile = await fetch("/api/profile").then((r) => r.json()).catch(() => ({}));
       const result = await callPlanningAi({
         ai: planner.ai,
+        apiKey: localAiKey,
         serverKeyOk: serverAiKeyLoaded,
         maxTokens: 800,
         messages: [
