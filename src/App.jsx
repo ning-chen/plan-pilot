@@ -2,6 +2,7 @@
 import {
   CalendarDays,
   CheckCircle2,
+  CheckSquare,
   ChevronRight,
   Clock3,
   Download,
@@ -15,6 +16,7 @@ import {
   Send,
   Settings,
   Sparkles,
+  Square,
   Target,
   Trash2,
   Upload,
@@ -1107,6 +1109,44 @@ function sortBlocks(blocks) {
   return [...blocks].sort((a, b) => toMinutes(a.start) - toMinutes(b.start));
 }
 
+// Greedy lane assignment for overlapping blocks. Each block gets a `_col`
+// (its lane index) and `_totalCols` (number of lanes in its overlap cluster)
+// so the timeline can render them side-by-side instead of stacking on top.
+//
+// Complexity: O(n log n) for the sort, O(n × max_overlap) for the sweep.
+// In practice max_overlap is bounded by daily schedule density (~3-5),
+// so this is effectively O(n). The naive alternative recomputing totalCols
+// per block via a full filter would be O(n²).
+function assignTimelineColumns(blocks) {
+  const sorted = [...blocks]
+    .sort((a, b) => toMinutes(a.start) - toMinutes(b.start))
+    .map((b) => ({ ...b }));
+  const active = []; // { block, endMin } — blocks still overlapping with current
+
+  for (const block of sorted) {
+    const startMin = toMinutes(block.start);
+    // Drop blocks that ended before this one started.
+    for (let i = active.length - 1; i >= 0; i--) {
+      if (active[i].endMin <= startMin) active.splice(i, 1);
+    }
+    // Pick smallest free lane among currently-active blocks.
+    const usedCols = new Set(active.map((a) => a.block._col));
+    let col = 0;
+    while (usedCols.has(col)) col++;
+    block._col = col;
+    // Compute shared totalCols = max lane index used by this block's cluster.
+    let maxCol = col;
+    for (const a of active) if (a.block._col > maxCol) maxCol = a.block._col;
+    const totalCols = maxCol + 1;
+    block._totalCols = totalCols;
+    // All active blocks share the same cluster → same totalCols.
+    for (const a of active) a.block._totalCols = totalCols;
+    active.push({ block, endMin: toMinutes(block.end) });
+  }
+
+  return sorted;
+}
+
 function getProtectedBreaks(settings) {
   // find midday gaps >30min between work segments
   const segs = settings.workSegments || [];
@@ -1168,7 +1208,48 @@ function polishAiBlocks(blocks, segments) {
     break; // only check last block
   }
 
-  return result;
+  // Safety net: even with the HARD BOUNDARY RULE in the prompt, AI may still
+  // emit blocks outside work segments (weak models, temperature drift, JSON
+  // truncation). Force-clamp start/end into the nearest segment and drop
+  // anything that collapses below 5 min — those are too short to render or
+  // interact with meaningfully.
+  return clampToSegments(result, segments);
+}
+
+// Force every block to lie strictly within one of `segments`. Blocks that
+// don't fit are clamped (start/end pulled into the nearest segment that
+// contains the midpoint); if a block has no overlap with any segment, it's
+// dropped. Blocks shorter than MIN_BLOCK_MIN after clamping are also dropped.
+function clampToSegments(blocks, segments) {
+  const MIN_BLOCK_MIN = 5;
+  if (!segments.length) return blocks.filter(() => false);
+  const segRanges = segments.map((s) => ({ start: toMinutes(s.start), end: toMinutes(s.end) }));
+
+  return blocks
+    .filter((b) => b && b.start && b.end)
+    .map((b) => {
+      const sMin = toMinutes(b.start);
+      const eMin = toMinutes(b.end);
+      if (eMin <= sMin) return { ...b, _drop: true };
+      // Find segment containing the block midpoint, or nearest one.
+      const mid = (sMin + eMin) / 2;
+      let seg = segRanges.find((s) => mid >= s.start && mid <= s.end);
+      if (!seg) {
+        // Pick nearest segment by midpoint distance.
+        let best = segRanges[0];
+        let bestDist = Math.abs(mid - (best.start + best.end) / 2);
+        for (const s of segRanges) {
+          const d = Math.abs(mid - (s.start + s.end) / 2);
+          if (d < bestDist) { best = s; bestDist = d; }
+        }
+        seg = best;
+      }
+      const newStart = Math.max(sMin, seg.start);
+      const newEnd = Math.min(eMin, seg.end);
+      const newDur = newEnd - newStart;
+      if (newDur < MIN_BLOCK_MIN) return { ...b, _drop: true };
+      return { ...b, start: toTime(newStart), end: toTime(newEnd) };
+    });
 }
 
 function workloadMinutes(settings) {
@@ -1731,7 +1812,7 @@ function App() {
   );
 
   const todayBlocks = useMemo(
-    () => sortBlocks(planner.blocks.filter((block) => block.date === selectedDate)),
+    () => assignTimelineColumns(planner.blocks.filter((block) => block.date === selectedDate)),
     [planner.blocks, selectedDate],
   );
 
@@ -1983,6 +2064,8 @@ function App() {
         type: String(fieldValue(form, "type", goalDraft.type)),
         parentId: String(fieldValue(form, "parentId", goalDraft.parentId || "")),
         priority: String(fieldValue(form, "priority", goalDraft.priority)),
+        startDate: "",
+        endDate: "",
         status: "active",
         progress: 0,
         createdAt: new Date().toISOString(),
@@ -2058,6 +2141,14 @@ function App() {
       return;
     }
 
+    const workSegments = (planner.settings.workSegments || []).map((s) => ({ start: s.start, end: s.end }));
+    const protectedBreaks = getProtectedBreaks(planner.settings);
+    const segList = workSegments.map((s) => `${s.start}-${s.end}`).join("、");
+    const breakDesc =
+      protectedBreaks.length > 0
+        ? protectedBreaks.map((b) => `${b.start}-${b.end}`).join("、")
+        : "无";
+
     setAiStatus({ loading: true, error: "", message: "AI 正在为你安排今日时间..." });
     try {
       const result = await callPlanningAi({
@@ -2068,15 +2159,17 @@ function App() {
           {
             role: "system",
             content:
-              "You are a proactive daily time-blocking planner. Return only JSON: {\"message\":\"short scheduling note\",\"taskAdjustments\":[{\"taskId\":\"existing task id\",\"estimateMinutes\":120,\"reason\":\"why the estimate changed\"}],\"blocks\":[{\"taskId\":\"existing task id\",\"start\":\"HH:MM\",\"end\":\"HH:MM\",\"title\":\"optional\"}],\"questions\":[{\"taskId\":\"optional\",\"title\":\"...\",\"reason\":\"why uncertain\",\"hint\":\"what user should decide\"}]}. Use only existing task ids and never invent tasks. Re-plan the day from scratch on every call while respecting manual/fixed blocks and the already-pinned fixedTimeTasks as hard constraints: never output blocks for fixedTimeTasks and never overlap their time ranges; schedule the remaining tasks around them. Do not merely place tasks in input order: reason about urgency, cognitive load, context switching, dependencies, deadlines, energy, and realistic duration. Protect lunch 12:00-13:00 by default. Put deep research/design/writing work into coherent focus blocks, light admin work into lower-energy windows, and preserve dependencies: print before scan/upload/submit, scan before upload, outline/framework/core points before drafting, meeting preparation before the meeting, and meeting follow-up after the meeting. If a ticket-buying task does not say when the purchase itself must happen, ask the user instead of confusing the departure time with purchase time. If duration or placement is genuinely uncertain, ask one concise question instead of forcing a block.",
+              `You are a proactive daily time-blocking planner. Return only JSON: {\"message\":\"short scheduling note\",\"taskAdjustments\":[{\"taskId\":\"existing task id\",\"estimateMinutes\":120,\"reason\":\"why the estimate changed\"}],\"blocks\":[{\"taskId\":\"existing task id\",\"start\":\"HH:MM\",\"end\":\"HH:MM\",\"title\":\"optional\"}],\"questions\":[{\"taskId\":\"optional\",\"title\":\"...\",\"reason\":\"why uncertain\",\"hint\":\"what user should decide\"}]}.\n\n<<< HARD BOUNDARY RULE — VIOLATION IS UNACCEPTABLE >>>\nWork segments = [${segList}]. You MUST schedule EVERY block strictly within these time windows. A block starting before the first segment, ending after the last segment, or crossing into a protected break is a FATAL ERROR. Protected breaks (MUST NOT overlap any block): ${breakDesc}. Before outputting JSON, scan every block and verify: (1) start >= the segment's start, (2) end <= the segment's end, (3) the block does not intersect any protected break. If a task cannot fit, ask a question instead of violating the boundary.\n<<< END HARD BOUNDARY RULE >>>\n\nUse only existing task ids and never invent tasks. Re-plan the day from scratch on every call while respecting manual/fixed blocks and the already-pinned fixedTimeTasks as hard constraints: never output blocks for fixedTimeTasks and never overlap their time ranges; schedule the remaining tasks around them. Do not merely place tasks in input order: reason about urgency, cognitive load, context switching, dependencies, deadlines, energy, and realistic duration. Put deep research/design/writing work into coherent focus blocks, light admin work into lower-energy windows, and preserve dependencies: print before scan/upload/submit, scan before upload, outline/framework/core points before drafting, meeting preparation before the meeting, and meeting follow-up after the meeting. If a ticket-buying task does not say when the purchase itself must happen, ask the user instead of confusing the departure time with purchase time. If duration or placement is genuinely uncertain, ask one concise question instead of forcing a block. Time-splitting guidance: when multiple tasks in the same priority tier compete for limited time in one segment, split the available contiguous time among them proportionally by estimateMinutes rather than stacking arbitrarily. If a large task (≥120 min) cannot fit in a single free interval, consider splitting it across two sessions (e.g. morning + afternoon). Prefer high-focus deep work in the longest uninterrupted slots; put light admin tasks into shorter gaps. The currentAutoBlocks in the payload show what was previously auto-scheduled — you may keep, adjust, or replace them, but always explain significant changes in the message.`,
           },
           {
             role: "user",
             content: JSON.stringify({
               date: selectedDate,
-              settings: planner.settings,
+              startOfDay: (planner.settings.workSegments && planner.settings.workSegments[0] && planner.settings.workSegments[0].start) || "09:00",
+              endOfDay: (planner.settings.workSegments && planner.settings.workSegments[planner.settings.workSegments.length - 1] && planner.settings.workSegments[planner.settings.workSegments.length - 1].end) || "18:00",
+              workSegments,
               dayPlan,
-              protectedBreaks: getProtectedBreaks(planner.settings),
+              protectedBreaks,
               tasks: prepared.tasks
                 .filter((task) => task.date === selectedDate && task.status !== "done" && !task.fixedTime && task.kind !== "fixed")
                 .map(({ id, title, estimateMinutes, priority, goalId }) => ({
@@ -2089,6 +2182,9 @@ function App() {
               manualBlocks: prepared.blocks
                 .filter((block) => block.date === selectedDate && !block.auto)
                 .map(({ title, taskId, type, start, end }) => ({ title, taskId, type, start, end })),
+              currentAutoBlocks: prepared.blocks
+                .filter((block) => block.date === selectedDate && block.auto)
+                .map(({ title, taskId, start, end }) => ({ title, taskId, start, end })),
               fixedTimeTasks: prepared.tasks
                 .filter((task) => task.date === selectedDate && task.status !== "done" && task.fixedTime && task.fixedStart)
                 .map(({ title, fixedStart, estimateMinutes }) => ({ title, start: fixedStart, estimateMinutes })),
@@ -3090,7 +3186,6 @@ function App() {
           ))}
           {(planner.settings.workSegments || []).length < 3 && (
             <button className="compact-action" onClick={() => {
-              const totalMin = workloadMinutes(planner.settings);
               setSegmentDraft({ start: "09:00", end: "12:00" });
               setShowSegmentModal(true);
             }}>
@@ -3493,7 +3588,7 @@ function App() {
   );
 }
 
-function DayTimeline({ blocks, taskById, settings, selectedDate, onReschedule, onDropTask, onEdit, onDelete }) {
+function DayTimeline({ blocks, taskById, settings, selectedDate, onReschedule, onDropTask, onEdit, onDelete, onToggleDone }) {
   const PXH = 56; // 每小时像素
   const ppm = PXH / 60;
   const segs = settings.workSegments || [];
@@ -3618,13 +3713,40 @@ function DayTimeline({ blocks, taskById, settings, selectedDate, onReschedule, o
         else if (task?.priority === "high") cls = "priority-high";
         else if (task?.priority === "medium") cls = "priority-medium";
         else if (task?.priority === "low") cls = "priority-low";
+        const col = block._col ?? 0;
+        const cols = block._totalCols ?? 1;
+        // When overlapping, shift left/width so blocks render side-by-side.
+        // Single blocks keep the original full-width layout (right: 2px).
+        const blkStyle = cols > 1
+          ? {
+              top,
+              height: h,
+              left: `calc(50px + (100% - 52px) * ${col / cols})`,
+              width: `calc((100% - 52px) / ${cols} - 2px)`,
+              right: "auto",
+            }
+          : { top, height: h };
         return (
           <article
-            className={`dt-blk dt-${cls}${isDragging ? " dragging" : ""}`}
+            className={`dt-blk dt-${cls}${isDragging ? " dragging" : ""}${task?.status === "done" ? " dt-done" : ""}`}
             key={block.id}
-            style={{ top, height: h }}
+            style={blkStyle}
             onPointerDown={(e) => startDrag(e, block, "move")}
           >
+            {!busy && block.taskId && task && onToggleDone && (
+              <button
+                type="button"
+                className={`dt-check${task.status === "done" ? " is-done" : ""}`}
+                role="checkbox"
+                aria-checked={task.status === "done"}
+                aria-label={task.status === "done" ? "标记未完成" : "标记完成"}
+                title={task.status === "done" ? "标记未完成" : "标记完成"}
+                onPointerDown={(e) => e.stopPropagation()}
+                onClick={(e) => { e.stopPropagation(); onToggleDone(block); }}
+              >
+                {task.status === "done" ? <CheckSquare size={16} /> : <Square size={16} />}
+              </button>
+            )}
             <div className="dt-body">
               <div className="dt-bt">{title}</div>
               <div className="dt-bm">
@@ -4185,11 +4307,15 @@ function TodayView({
                 title="拖到右侧时间轴可安排到具体时间"
               >
                 <button
-                  className="check-button"
+                  type="button"
+                  className={`check-button${task.status === "done" ? " is-done" : ""}`}
+                  role="checkbox"
+                  aria-checked={task.status === "done"}
+                  aria-label={task.status === "done" ? "标记未完成" : "标记完成"}
                   title={task.status === "done" ? "标记未完成" : "标记完成"}
                   onClick={() => updateTask(task.id, { status: task.status === "done" ? "open" : "done" })}
                 >
-                  <CheckCircle2 size={20} />
+                  {task.status === "done" ? <CheckSquare size={20} /> : <Square size={20} />}
                 </button>
                 <div className="task-main">
                   <strong>{task.title}</strong>
@@ -4454,6 +4580,10 @@ function TodayView({
           onDropTask={scheduleTaskAtMinute}
           onEdit={startEditingBlock}
           onDelete={deleteBlock}
+          onToggleDone={(block) => {
+            const t = taskById[block.taskId];
+            if (t) updateTask(t.id, { status: t.status === "done" ? "open" : "done" });
+          }}
         />
       </section>
     </div>
@@ -4703,6 +4833,12 @@ function buildGoalGantt(goals, tasks, todayStr) {
     visiting.add(goalId);
     const dates = [];
     (tasksByGoal[goalId] || []).forEach((t) => { if (/^\d{4}-\d{2}-\d{2}$/.test(t.date)) dates.push(t.date); });
+    const goalObj = goalMap[goalId];
+    const startDate = goalObj?.startDate && /^\d{4}-\d{2}-\d{2}$/.test(goalObj.startDate) ? goalObj.startDate : "";
+    const endDate = goalObj?.endDate && /^\d{4}-\d{2}-\d{2}$/.test(goalObj.endDate) ? goalObj.endDate : "";
+    if (startDate) dates.push(startDate);
+    if (endDate) dates.push(endDate);
+    const hasExplicit = !!(startDate || endDate);
     const childSpans = (childrenMap[goalId] || []).map((c) => spanOf(c.id, visiting)).filter(Boolean);
     const starts = dates.concat(childSpans.map((s) => s.start));
     const ends = dates.concat(childSpans.map((s) => s.end));
@@ -4712,8 +4848,11 @@ function buildGoalGantt(goals, tasks, todayStr) {
       let end = ends[0];
       starts.forEach((d) => { if (d < start) start = d; });
       ends.forEach((d) => { if (d > end) end = d; });
+      // 单边日期补另一边（保底 1 天宽度，避免 bar 塌缩成点）
+      if (startDate && !endDate) end = addDays(startDate, 1);
+      else if (endDate && !startDate) start = addDays(endDate, -1);
       const hasTasks = dates.length > 0 || childSpans.some((s) => s.derived === "tasks");
-      info = { start, end, derived: hasTasks ? "tasks" : "type" };
+      info = { start, end, derived: hasExplicit ? "explicit" : hasTasks ? "tasks" : "type" };
     } else {
       const type = (goalMap[goalId] && goalMap[goalId].type) || "month";
       info = { start: todayStr, end: addDays(todayStr, HORIZON[type] || 28), derived: "type" };
@@ -4747,25 +4886,35 @@ function buildGoalGantt(goals, tasks, todayStr) {
 
 function GoalGantt({ goals, tasks, goalById, updateGoal, deleteGoal }) {
   const [editingGoalId, setEditingGoalId] = useState(null);
-  const [editDraft, setEditDraft] = useState({ title: "", type: "long", priority: "medium", parentId: "" });
+  const [editDraft, setEditDraft] = useState({ title: "", type: "long", priority: "medium", parentId: "", startDate: "", endDate: "" });
+  const [editError, setEditError] = useState("");
   const today = getLocalDate();
 
   function startEditingGoal(goal) {
     setEditingGoalId(goal.id);
-    setEditDraft({ title: goal.title, type: goal.type, priority: goal.priority, parentId: goal.parentId || "" });
+    setEditDraft({ title: goal.title, type: goal.type, priority: goal.priority, parentId: goal.parentId || "", startDate: goal.startDate || "", endDate: goal.endDate || "" });
+    setEditError("");
   }
   function cancelEditingGoal() {
     setEditingGoalId(null);
+    setEditError("");
   }
   function saveEditingGoal(goalId) {
     if (!editDraft.title.trim()) return;
+    if (editDraft.startDate && editDraft.endDate && editDraft.startDate > editDraft.endDate) {
+      setEditError("结束日期不能早于开始日期");
+      return;
+    }
     updateGoal(goalId, {
       title: editDraft.title.trim(),
       type: editDraft.type,
       priority: editDraft.priority,
       parentId: editDraft.parentId || "",
+      startDate: editDraft.startDate || "",
+      endDate: editDraft.endDate || "",
     });
     setEditingGoalId(null);
+    setEditError("");
   }
   function handleStatusChange(goal, status) {
     if (status === "done") updateGoal(goal.id, { status: "done", progress: 100 });
@@ -4861,6 +5010,25 @@ function GoalGantt({ goals, tasks, goalById, updateGoal, deleteGoal }) {
                           ))}
                       </select>
                     </div>
+                    <div className="goal-edit-row">
+                      <label>
+                        开始
+                        <input
+                          type="date"
+                          value={editDraft.startDate}
+                          onChange={(e) => { setEditDraft((d) => ({ ...d, startDate: e.target.value })); setEditError(""); }}
+                        />
+                      </label>
+                      <label>
+                        结束
+                        <input
+                          type="date"
+                          value={editDraft.endDate}
+                          onChange={(e) => { setEditDraft((d) => ({ ...d, endDate: e.target.value })); setEditError(""); }}
+                        />
+                      </label>
+                    </div>
+                    {editError && <div className="goal-edit-error">{editError}</div>}
                     <div className="goal-edit-actions">
                       <button className="secondary-action" onClick={() => saveEditingGoal(goal.id)}>保存</button>
                       <button className="secondary-action" onClick={cancelEditingGoal}>取消</button>
@@ -4914,9 +5082,9 @@ function GoalGantt({ goals, tasks, goalById, updateGoal, deleteGoal }) {
                   ))}
                   {showToday && <span className="gantt-track-today" style={{ left: `${pct(today)}%` }} />}
                   <div
-                    className={`gantt-bar status-${goal.status} priority-${goal.priority}${span.derived === "type" ? " estimated" : ""}`}
+                    className={`gantt-bar status-${goal.status} priority-${goal.priority}${span.derived === "type" ? " estimated" : ""}${span.derived === "explicit" ? " explicit" : ""}`}
                     style={{ left: `${left}%`, width: `${width}%` }}
-                    title={`${span.start} → ${span.end}（${span.derived === "tasks" ? "按关联任务" : "按类型估算"}）`}
+                    title={`${span.start} → ${span.end}（${span.derived === "explicit" ? "手动指定" : span.derived === "tasks" ? "按关联任务" : "按类型估算"}）`}
                   >
                     <span className="gantt-bar-fill" style={{ width: `${progress}%` }} />
                     <span className="gantt-bar-pct">{progress}%</span>
