@@ -41,6 +41,8 @@ import { tryExtractJson } from "./jsonExtract.js";
 import { APP_NAME, APP_SHORT_NAME, STORAGE_KEY } from "./constants/appConstants.js";
 import { AI_PROVIDER_PRESETS, getAiProviderPreset } from "./constants/aiProviders.js";
 import { defaultState } from "./app/initialState.js";
+import { EmptyState } from "./components/EmptyState.jsx";
+import { ErrorBoundary } from "./components/ErrorBoundary.jsx";
 import { useLocalAiKey } from "./hooks/useLocalAiKey.js";
 import { uid } from "./utils/ids.js";
 import {
@@ -5130,49 +5132,6 @@ function Metric({ label, value, tone = "" }) {
       <strong>{value}</strong>
     </article>
   );
-}
-
-function EmptyState({ icon, text }) {
-  return (
-    <div className="empty-state">
-      {icon}
-      <span>{text}</span>
-    </div>
-  );
-}
-
-// 渲染崩溃兜底：避免白屏，给出可刷新的提示 —— from PR #6 (hrjtju)
-export class ErrorBoundary extends React.Component {
-  constructor(props) {
-    super(props);
-    this.state = { error: null };
-  }
-  static getDerivedStateFromError(error) {
-    return { error };
-  }
-  componentDidCatch(error, info) {
-    console.error("ErrorBoundary caught:", error, info);
-  }
-  render() {
-    if (this.state.error) {
-      return (
-        <div style={{ padding: 48, textAlign: "center" }}>
-          <h2 style={{ marginBottom: 12 }}>页面出错了</h2>
-          <p style={{ color: "#667085", marginBottom: 16 }}>{this.state.error.message}</p>
-          <button
-            className="primary-action"
-            onClick={() => {
-              this.setState({ error: null });
-              window.location.reload();
-            }}
-          >
-            刷新页面
-          </button>
-        </div>
-      );
-    }
-    return this.props.children;
-  }
 }
 
 export default App;
