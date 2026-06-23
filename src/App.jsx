@@ -40,6 +40,7 @@ import {
 import { tryExtractJson } from "./jsonExtract.js";
 import { APP_NAME, APP_SHORT_NAME, STORAGE_KEY, AI_KEY_STORAGE_KEY } from "./constants/appConstants.js";
 import { AI_PROVIDER_PRESETS, getAiProviderPreset } from "./constants/aiProviders.js";
+import { defaultState } from "./app/initialState.js";
 import { uid } from "./utils/ids.js";
 import {
   addDays,
@@ -59,28 +60,6 @@ import {
   energyColorMap,
   energyColor,
 } from "./constants/labels.js";
-
-const defaultState = {
-  settings: {
-    workSegments: [{ start: "09:00", end: "12:00" }, { start: "14:00", end: "18:00" }],
-    shortBreak: 10,
-    longBreak: 30,
-  },
-  ai: {
-    enabled: true,
-    provider: "deepseek",
-    protocol: "openai-compatible",
-    baseUrl: "https://api.deepseek.com",
-    model: "deepseek-v4-pro",
-    profileLearningEnabled: false,
-  },
-  goals: [],
-  tasks: [],
-  blocks: [],
-  dayPlans: {},
-  reviews: [],
-  recurring: [],
-};
 
 function readLocalAiKey() {
   try {
