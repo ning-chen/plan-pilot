@@ -24,6 +24,7 @@
 - AI 排期容错：当浏览器 + 服务端都没配置 Key 时直接报错，不再发起 400 网络请求才知道没配置。
 - 顶部统计栏修复：完成/总数、预计、已排、可用 4 个指标之前会被压扁成窄条（CSS 高度塌缩 bug），现在正常显示。
 - 共享常量重构（@chen9527，PR #19）：把分散在 App.jsx 的服务商预设、字体、字号等常量抽到 `src/constants/`，纯重构、零行为变化，便于后续维护。
+- 共享助手与状态拆分（@chen9527，PR #27）：把日期时间工具（`addDays` / `formatHumanDate` / `toMinutes` 等）、uid 生成、默认 state、浏览器 Key 读写 hook 拆到 `src/utils/` / `src/hooks/` / `src/app/`，`App.jsx` 减少约 100 行；行为不变，`callPlanningAi` 的 API Key 改为调用方显式传入，更易复用。
 
 ### 2026-06-05
 
