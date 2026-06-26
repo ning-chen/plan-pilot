@@ -42,6 +42,7 @@ import { emptyDraft, mergeCoachDraft, actionToItem, coachMessageFrom } from "./c
 import { APP_NAME, APP_SHORT_NAME, STORAGE_KEY } from "./constants/appConstants.js";
 import { AI_PROVIDER_PRESETS, getAiProviderPreset } from "./constants/aiProviders.js";
 import { defaultState } from "./app/initialState.js";
+import { hydrateState, replaceRecurringBlocks } from "./planner/hydration.js";
 import { EmptyState } from "./components/EmptyState.jsx";
 import { ErrorBoundary } from "./components/ErrorBoundary.jsx";
 import { useLocalAiKey } from "./hooks/useLocalAiKey.js";
@@ -65,96 +66,12 @@ import {
   energyColor,
 } from "./constants/labels.js";
 
-function isRecurringDerivedBlock(block) {
-  return Boolean(block?.recurringDerived) || String(block?.id || "").startsWith("rec-");
-}
-
-function expandRecurringBlocks(items, existingBlocks = []) {
-  if (!Array.isArray(items) || items.length === 0) return [];
-  const blocks = [];
-  const today = new Date();
-  const existingKeys = new Set(
-    existingBlocks.map((block) => `${block.date}|${block.start}|${block.taskId || block.title || ""}`),
-  );
-
-  items.forEach((item) => {
-    if (!Number.isInteger(item.dayOfWeek) || item.dayOfWeek < 0 || item.dayOfWeek > 6) return;
-    const cursor = new Date(today.getFullYear(), today.getMonth(), today.getDate());
-    const endDate = item.endDate ? new Date(`${item.endDate}T00:00:00`) : null;
-    const maxDate = new Date(today.getFullYear() + 1, today.getMonth(), today.getDate());
-    const limit = endDate && endDate < maxDate ? endDate : maxDate;
-
-    while (cursor <= limit) {
-      if (cursor.getDay() === item.dayOfWeek) {
-        const date = getLocalDate(cursor);
-        const key = `${date}|${item.start}|${item.taskId || item.title || ""}`;
-        if (!existingKeys.has(key)) {
-          blocks.push({
-            id: `rec-${item.id || ""}-${date}`,
-            recurringId: item.id || "",
-            recurringDerived: true,
-            date,
-            type: "busy",
-            taskId: "",
-            title: item.title || "",
-            start: item.start,
-            end: item.end,
-            auto: false,
-          });
-          existingKeys.add(key);
-        }
-      }
-      cursor.setDate(cursor.getDate() + 1);
-    }
-  });
-
-  return blocks;
-}
-
-function replaceRecurringBlocks(items, blocks = []) {
-  const manualBlocks = blocks.filter((block) => !isRecurringDerivedBlock(block));
-  return manualBlocks.concat(expandRecurringBlocks(items, manualBlocks));
-}
-
-
 function sum(values) {
   return values.reduce((total, item) => total + item, 0);
 }
 
 function fieldValue(form, name, fallback = "") {
   return form?.elements?.[name]?.value ?? fallback;
-}
-
-function hydrateState(input) {
-  return {
-    ...defaultState,
-    ...input,
-    settings: {
-      ...defaultState.settings,
-      ...(input?.settings || {}),
-      // backward compat: convert old workStart/workEnd to workSegments
-      workSegments: input?.settings?.workSegments ||
-        (input?.settings?.workStart ? [{ start: input.settings.workStart, end: input.settings.workEnd || "18:00" }] : defaultState.settings.workSegments),
-      shortBreak: input?.settings?.shortBreak ?? input?.settings?.breakMinutes ?? defaultState.settings.shortBreak,
-      longBreak: input?.settings?.longBreak ?? defaultState.settings.longBreak,
-    },
-    ai: (() => {
-      const ai = { ...defaultState.ai, ...(input?.ai || {}) };
-      delete ai.apiKey;
-      return ai;
-    })(),
-    goals: Array.isArray(input?.goals)
-      ? input.goals.map((g) => ({ progress: 0, ...g }))
-      : [],
-    tasks: mergeDuplicateTasks(Array.isArray(input?.tasks) ? input.tasks : []),
-    blocks: replaceRecurringBlocks(
-      Array.isArray(input?.recurring) ? input.recurring : [],
-      Array.isArray(input?.blocks) ? input.blocks : [],
-    ),
-    dayPlans: input?.dayPlans && typeof input.dayPlans === "object" ? input.dayPlans : {},
-    reviews: Array.isArray(input?.reviews) ? input.reviews : [],
-    recurring: Array.isArray(input?.recurring) ? input.recurring : (defaultState.recurring || []),
-  };
 }
 
 function makeBreakdown(goal, draft, selectedDate) {
@@ -565,6 +482,10 @@ function compactTaskList(tasks) {
 
 function mergeDuplicateTasks(tasks) {
   return compactTaskList(tasks).tasks;
+}
+
+function hydratePlannerState(input) {
+  return hydrateState(input, { mergeTasks: mergeDuplicateTasks });
 }
 
 function filterBreakdownItems(items, planner, goal) {
@@ -979,7 +900,7 @@ function usePlannerStore() {
   const [state, setState] = useState(() => {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
-      return raw ? hydrateState(JSON.parse(raw)) : defaultState;
+      return raw ? hydratePlannerState(JSON.parse(raw)) : defaultState;
     } catch {
       return defaultState;
     }
@@ -1003,7 +924,7 @@ function usePlannerStore() {
             (fileData.settings != null && typeof fileData.settings === "object" && Object.keys(fileData.settings).length > 0) ||
             (fileData.ai != null && typeof fileData.ai === "object" && Object.keys(fileData.ai).length > 0);
           if (hasContent) {
-            const merged = hydrateState(fileData);
+            const merged = hydratePlannerState(fileData);
             setState(merged);
             localStorage.setItem(STORAGE_KEY, JSON.stringify(merged));
           } else {
@@ -2924,7 +2845,7 @@ function App() {
       if (input !== null) window.alert("输入不匹配，操作已取消。");
       return;
     }
-    setPlanner(hydrateState(defaultState));
+    setPlanner(hydratePlannerState(defaultState));
     updateLocalAiKey("");
     // Immediately persist empty state to server to clear disk files
     fetch("/api/data", {
@@ -2959,7 +2880,7 @@ function App() {
     const reader = new FileReader();
     reader.onload = () => {
       try {
-        setPlanner(hydrateState(JSON.parse(String(reader.result || "{}"))));
+        setPlanner(hydratePlannerState(JSON.parse(String(reader.result || "{}"))));
       } catch {
         window.alert("导入失败：JSON 格式不正确。");
       }
